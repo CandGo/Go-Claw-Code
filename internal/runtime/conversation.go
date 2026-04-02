@@ -38,6 +38,24 @@ func NewConversationRuntime(provider api.Provider, tools ToolExecutor, model str
 	}
 }
 
+// ShouldCompact checks if the session needs compaction.
+func (rt *ConversationRuntime) ShouldCompact(cfg CompactionConfig) bool {
+	return rt.session.ShouldCompact(cfg)
+}
+
+// Compact compacts the session history.
+func (rt *ConversationRuntime) Compact(cfg CompactionConfig) {
+	rt.session.Compact(cfg)
+}
+
+// DefaultCompactionConfig returns default compaction settings.
+func DefaultCompactionConfig() CompactionConfig {
+	return CompactionConfig{
+		PreserveRecent: compactionPreserveRecent,
+		MaxTokens:      compactionMaxTokens,
+	}
+}
+
 // RunTurn executes one user turn: send prompt, get response, execute tools, loop.
 func (rt *ConversationRuntime) RunTurn(ctx context.Context, prompt string) ([]TurnOutput, *TokenUsage, error) {
 	// Add user message

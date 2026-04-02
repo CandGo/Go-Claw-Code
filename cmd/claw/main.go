@@ -12,11 +12,13 @@ import (
 	"github.com/ergochat/readline"
 
 	"github.com/go-claw/claw/internal/api"
+	"github.com/go-claw/claw/internal/commands"
+	"github.com/go-claw/claw/internal/config"
 	"github.com/go-claw/claw/internal/runtime"
 	"github.com/go-claw/claw/internal/tools"
 )
 
-const version = "0.1.0"
+const version = "0.2.0"
 
 func main() {
 	if err := run(); err != nil {
@@ -27,27 +29,29 @@ func main() {
 
 func run() error {
 	var (
-		modelFlag      string
-		permFlag       string
-		outputFormat   string
-		showVersion    bool
-		showPrompt     bool
-		showAgents     bool
-		showSkills     bool
+		modelFlag    string
+		permFlag     string
+		outputFormat string
+		showVersion  bool
+		showPrompt   bool
+		showAgents   bool
+		showSkills   bool
+		showConfig   bool
 	)
 
 	fs := flag.NewFlagSet("claw", flag.ExitOnError)
 	fs.StringVar(&modelFlag, "model", "", "Override the active model")
-	fs.StringVar(&permFlag, "permission-mode", "danger-full-access", "Permission mode: read-only, workspace-write, danger-full-access")
+	fs.StringVar(&permFlag, "permission-mode", "", "Permission mode: read-only, workspace-write, danger-full-access")
 	fs.StringVar(&outputFormat, "output-format", "text", "Non-interactive output format: text or json")
 	fs.BoolVar(&showVersion, "version", false, "Print version")
 	fs.BoolVar(&showPrompt, "system-prompt", false, "Print system prompt")
 	fs.BoolVar(&showAgents, "agents", false, "List agents")
 	fs.BoolVar(&showSkills, "skills", false, "List skills")
+	fs.BoolVar(&showConfig, "show-config", false, "Show configuration sources")
 	fs.Parse(os.Args[1:])
 
 	if showVersion {
-		fmt.Printf("Claw Code (Go)\n  Version: %s\n  Built: %s\n", version, time.Now().Format("2006-03-31"))
+		fmt.Printf("Claw Code (Go)\n  Version: %s\n  Go: %s\n  OS: %s/%s\n", version, "1.23", os.Getenv("GOOS"), os.Getenv("GOARCH"))
 		return nil
 	}
 
@@ -57,17 +61,53 @@ func run() error {
 	}
 
 	if showAgents {
-		fmt.Println("No agents found.")
+		agents := tools.GetAgents()
+		if len(agents) == 0 {
+			fmt.Println("No agents running.")
+		} else {
+			for _, a := range agents {
+				fmt.Printf("  %s [%s] %s - %s\n", a.ID, a.Status, a.Type, a.Description)
+			}
+		}
 		return nil
 	}
 
 	if showSkills {
-		fmt.Println("No skills found.")
+		skills := tools.DiscoverSkills()
+		if len(skills) == 0 {
+			fmt.Println("No skills found. Create skills in .claw/skills/ or ~/.claw/skills/")
+		} else {
+			for _, s := range skills {
+				fmt.Printf("  - %s\n", s)
+			}
+		}
 		return nil
 	}
 
+	if showConfig {
+		fmt.Println("Configuration sources:")
+		fmt.Print(config.DescribeSources())
+		cfg, err := config.Load()
+		if err != nil {
+			return err
+		}
+		fmt.Printf("\nEffective config:\n")
+		fmt.Printf("  Model: %s\n", cfg.Model)
+		fmt.Printf("  Permission mode: %s\n", cfg.PermissionMode)
+		fmt.Printf("  Pre-tool hooks: %d\n", len(cfg.Hooks.PreToolUse))
+		fmt.Printf("  Post-tool hooks: %d\n", len(cfg.Hooks.PostToolUse))
+		fmt.Printf("  MCP servers: %d\n", len(cfg.MCPServers))
+		return nil
+	}
+
+	// Load config
+	cfg, err := config.Load()
+	if err != nil {
+		return err
+	}
+
 	// Resolve model
-	model := resolveArg(modelFlag, "ANTHROPIC_MODEL", "claude-sonnet-4-6")
+	model := resolveArg(modelFlag, "ANTHROPIC_MODEL", cfg.Model)
 	model = api.ResolveModelAlias(model)
 
 	// Resolve auth
@@ -78,11 +118,19 @@ func run() error {
 
 	baseURL := api.BaseURL()
 
+	// Permission mode
+	permMode := resolveArg(permFlag, "CLAW_PERMISSION_MODE", cfg.PermissionMode)
+	_ = permMode // used by runtime policy
+
 	// Create provider
 	provider := api.NewProvider(model, auth, baseURL)
 
 	// Create tools
 	toolReg := tools.NewToolRegistry()
+
+	// Create hook runner from config
+	hookRunner := runtime.NewHookRunner(cfg.Hooks.PreToolUse, cfg.Hooks.PostToolUse)
+	_ = hookRunner // will be integrated into runtime
 
 	// Create runtime
 	rt := runtime.NewConversationRuntime(provider, toolReg, model)
@@ -95,7 +143,7 @@ func run() error {
 	}
 
 	// Interactive REPL
-	return runREPL(rt)
+	return runREPL(rt, cfg)
 }
 
 func runOnce(rt *runtime.ConversationRuntime, prompt string, format string) error {
@@ -124,10 +172,11 @@ func runOnce(rt *runtime.ConversationRuntime, prompt string, format string) erro
 	return nil
 }
 
-func runREPL(rt *runtime.ConversationRuntime) error {
-	fmt.Println("Claw Code (Go) v" + version)
-	fmt.Printf("Model: %s\n", rt.Model())
-	fmt.Println("Type /help for commands, Ctrl+D to exit")
+func runREPL(rt *runtime.ConversationRuntime, cfg *config.Config) error {
+	fmt.Println("  Claw Code (Go) v" + version)
+	fmt.Printf("  Model: %s\n", rt.Model())
+	fmt.Printf("  Permission: %s\n", cfg.PermissionMode)
+	fmt.Println("  Type /help for commands, Ctrl+D to exit")
 	fmt.Println()
 
 	rl, err := readline.New("> ")
@@ -135,6 +184,8 @@ func runREPL(rt *runtime.ConversationRuntime) error {
 		return fmt.Errorf("failed to init readline: %w", err)
 	}
 	defer rl.Close()
+
+	compactionCfg := runtime.DefaultCompactionConfig()
 
 	for {
 		line, err := rl.Readline()
@@ -152,13 +203,36 @@ func runREPL(rt *runtime.ConversationRuntime) error {
 
 		// Handle slash commands
 		if strings.HasPrefix(line, "/") {
-			if err := handleCommand(line, rt); err != nil {
-				if err.Error() == "quit" {
-					break
-				}
+			cmd, cmdArgs := commands.Parse(line)
+			if cmd == nil {
+				fmt.Printf("Unknown command: /%s\n", cmdArgs)
+				continue
+			}
+			if cmd.Name == "quit" || cmd.Name == "exit" {
+				break
+			}
+			output, err := cmd.Handler(cmdArgs)
+			if err != nil {
 				fmt.Fprintf(os.Stderr, "error: %v\n", err)
+			} else if output != "" {
+				fmt.Println(output)
+			}
+			// Handle compact command specially
+			if cmd.Name == "compact" {
+				if rt.MessageCount() > compactionCfg.PreserveRecent {
+					rt.Compact(compactionCfg)
+					fmt.Printf("Compacted. Messages: %d\n", rt.MessageCount())
+				} else {
+					fmt.Println("Not enough messages to compact.")
+				}
 			}
 			continue
+		}
+
+		// Check if compaction is needed
+		if rt.ShouldCompact(compactionCfg) {
+			rt.Compact(compactionCfg)
+			fmt.Fprintf(os.Stderr, "  [auto-compacted, messages: %d]\n", rt.MessageCount())
 		}
 
 		// Run conversation turn
@@ -190,39 +264,6 @@ func runREPL(rt *runtime.ConversationRuntime) error {
 		fmt.Println()
 	}
 
-	return nil
-}
-
-func handleCommand(cmd string, rt *runtime.ConversationRuntime) error {
-	parts := strings.Fields(cmd)
-	name := parts[0]
-
-	switch name {
-	case "/help":
-		fmt.Println(`Slash commands:
-  /help      Show this help
-  /status    Show session status
-  /model     Show current model
-  /clear     Clear conversation
-  /compact   Compact conversation history
-  /cost      Show token usage
-  /quit      Exit`)
-	case "/status":
-		fmt.Printf("Model: %s\nMessages: %d\n", rt.Model(), rt.MessageCount())
-	case "/model":
-		fmt.Println(rt.Model())
-	case "/clear":
-		rt.Clear()
-		fmt.Println("Session cleared.")
-	case "/compact":
-		fmt.Println("Compaction not yet implemented.")
-	case "/cost":
-		fmt.Println("Cost tracking not yet implemented.")
-	case "/quit", "/exit":
-		return fmt.Errorf("quit")
-	default:
-		fmt.Printf("Unknown command: %s\n", name)
-	}
 	return nil
 }
 

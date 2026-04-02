@@ -19,6 +19,7 @@ type ToolSpec struct {
 	Description string
 	InputSchema map[string]interface{}
 	Handler     func(input map[string]interface{}) (string, error)
+	Aliases     []string
 }
 
 // ToolRegistry manages all available tools.
@@ -26,10 +27,14 @@ type ToolRegistry struct {
 	specs map[string]*ToolSpec
 }
 
+// globalRegistry is the singleton used by ToolSearch.
+var globalRegistry *ToolRegistry
+
 // NewToolRegistry creates a registry with all built-in tools.
 func NewToolRegistry() *ToolRegistry {
 	r := &ToolRegistry{specs: make(map[string]*ToolSpec)}
 
+	// Core file/shell tools
 	r.register(bashTool())
 	r.register(readTool())
 	r.register(writeTool())
@@ -37,6 +42,26 @@ func NewToolRegistry() *ToolRegistry {
 	r.register(globTool())
 	r.register(grepTool())
 
+	// Web tools
+	r.register(webFetchTool())
+	r.register(webSearchTool())
+
+	// Task management
+	r.register(todoWriteTool())
+
+	// Agent/skill
+	r.register(agentTool())
+	r.register(skillTool())
+
+	// Notebook
+	r.register(notebookEditTool())
+
+	// Misc
+	r.register(sleepTool())
+	r.register(toolSearchTool())
+	r.register(sendUserMessageTool())
+
+	globalRegistry = r
 	return r
 }
 
