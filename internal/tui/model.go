@@ -2,6 +2,7 @@ package tui
 
 import (
 	"context"
+	"fmt"
 	"strings"
 	"time"
 
@@ -37,23 +38,23 @@ type ToolMsg struct {
 
 // DoneMsg signals the turn is complete.
 type DoneMsg struct {
+	Text  string
 	Usage *runtime.TokenUsage
 	Err   error
 }
 
 // Model is the Bubbletea model for the Claw TUI.
 type Model struct {
-	state       SessionState
-	rt          *runtime.ConversationRuntime
-	compaction  runtime.CompactionConfig
-	input       textarea.Model
-	messages    []Message
-	statusLine  string
-	width       int
-	height      int
-	err         error
-	ctx         context.Context
-	cancel      context.CancelFunc
+	state      SessionState
+	rt         *runtime.ConversationRuntime
+	compaction runtime.CompactionConfig
+	input      textarea.Model
+	messages   []Message
+	statusLine string
+	width      int
+	height     int
+	ctx        context.Context
+	cancel     context.CancelFunc
 }
 
 // Message represents one displayed message in the conversation.
@@ -167,12 +168,11 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				// Submit user message
 				m.messages = append(m.messages, Message{Role: "user", Content: text, Time: time.Now()})
 				m.state = StateStreaming
-				m.statusLine = "Thinking..."
+				m.statusLine = lipgloss.NewStyle().Faint(true).Render("Thinking...")
 				m.ctx, m.cancel = context.WithCancel(context.Background())
-				return m, tea.Batch(m.runTurn(text))
+				return m, m.runTurn(text)
 
 			case "ctrl+l":
-				// Clear screen
 				m.messages = nil
 				return m, tea.ClearScreen
 			}
@@ -187,9 +187,9 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, nil
 
 	case ToolMsg:
-		m.statusLine = "Tool: " + msg.Name
+		m.statusLine = lipgloss.NewStyle().Foreground(lipgloss.Color("11")).Render("Tool: " + msg.Name)
 		if msg.Done {
-			m.state = StateIdle
+			m.statusLine = ""
 		}
 		return m, nil
 
@@ -198,9 +198,25 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if msg.Err != nil {
 			m.messages = append(m.messages, Message{Role: "system", Content: "error: " + msg.Err.Error(), Time: time.Now()})
 		}
+		if msg.Text != "" {
+			// Ensure assistant message is displayed
+			found := false
+			for i := len(m.messages) - 1; i >= 0; i-- {
+				if m.messages[i].Role == "assistant" {
+					if m.messages[i].Content == "" {
+						m.messages[i].Content = msg.Text
+					}
+					found = true
+					break
+				}
+			}
+			if !found {
+				m.messages = append(m.messages, Message{Role: "assistant", Content: msg.Text, Time: time.Now()})
+			}
+		}
 		if msg.Usage != nil {
 			m.statusLine = lipgloss.NewStyle().Faint(true).Render(
-				sprintf("tokens: in=%d out=%d", msg.Usage.InputTokens, msg.Usage.OutputTokens))
+				fmt.Sprintf("tokens: in=%d out=%d", msg.Usage.InputTokens, msg.Usage.OutputTokens))
 		} else {
 			m.statusLine = ""
 		}
@@ -219,10 +235,10 @@ func (m Model) View() string {
 	var sb strings.Builder
 
 	// Header
-	sb.WriteString(headerStyle.Render(" Claw Code v0.3.0 "))
+	sb.WriteString(headerStyle.Render(" Claw Code v0.4.0 "))
 	sb.WriteString("  ")
 	sb.WriteString(lipgloss.NewStyle().Faint(true).Render("Model: " + m.rt.Model()))
-	sb.WriteString("\n")
+	sb.WriteString("\n\n")
 
 	// Messages area
 	maxMsgLines := m.height - 8
@@ -234,12 +250,14 @@ func (m Model) View() string {
 		lines = lines[len(lines)-maxMsgLines:]
 	}
 	for _, l := range lines {
-		sb.WriteString(l + "\n")
+		sb.WriteString(l)
+		sb.WriteString("\n")
 	}
 
 	// Status
 	if m.statusLine != "" {
-		sb.WriteString(m.statusLine + "\n")
+		sb.WriteString(m.statusLine)
+		sb.WriteString("\n")
 	}
 
 	// Input area
@@ -252,13 +270,17 @@ func (m Model) View() string {
 
 func (m Model) renderMessages() []string {
 	var lines []string
+	w := m.width - 2
+	if w < 40 {
+		w = 80
+	}
 	for _, msg := range m.messages {
 		switch msg.Role {
 		case "user":
-			style := lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("12"))
+			style := lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("86"))
 			lines = append(lines, style.Render("> "+msg.Content))
 		case "assistant":
-			lines = append(lines, wordWrap(msg.Content, m.width-2))
+			lines = append(lines, wordWrap(msg.Content, w))
 		case "tool":
 			style := lipgloss.NewStyle().Foreground(lipgloss.Color("11"))
 			lines = append(lines, style.Render("  tool: "+msg.Content))
@@ -277,24 +299,21 @@ func (m Model) runTurn(prompt string) tea.Cmd {
 
 		outputs, usage, err := m.rt.RunTurn(ctx, prompt)
 
-		// Collect assistant text from outputs
+		// Collect all assistant text
 		var assistantText strings.Builder
 		for _, out := range outputs {
 			switch out.Type {
 			case "text":
 				assistantText.WriteString(out.Text)
-				assistantText.WriteString("\n")
-			case "tool_use":
-				_ = out.ToolName
 			}
 		}
 
-		return DoneMsg{Usage: usage, Err: err}
+		return DoneMsg{
+			Text:  assistantText.String(),
+			Usage: usage,
+			Err:   err,
+		}
 	}
-}
-
-func sprintf(format string, args ...interface{}) string {
-	return format
 }
 
 func wordWrap(s string, width int) string {
@@ -308,7 +327,6 @@ func wordWrap(s string, width int) string {
 			continue
 		}
 		for len(line) > width {
-			// Find last space before width
 			space := strings.LastIndex(line[:width], " ")
 			if space <= 0 {
 				space = width
