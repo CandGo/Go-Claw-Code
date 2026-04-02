@@ -117,11 +117,11 @@ func NewClient(ctx context.Context, command string, args []string, env map[strin
 // Initialize sends the initialize handshake to the MCP server.
 func (c *Client) Initialize(ctx context.Context) error {
 	params := map[string]interface{}{
-		"protocolVersion": "2024-11-05",
+		"protocolVersion": "2025-03-26",
 		"capabilities":    map[string]interface{}{},
 		"clientInfo": map[string]interface{}{
 			"name":    "claw-code-go",
-			"version": "0.3.0",
+			"version": "0.4.0",
 		},
 	}
 

@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/go-claw/claw/internal/api"
+	"github.com/go-claw/claw/internal/sandbox"
 )
 
 // PermissionLevel defines the required permission for a tool.
@@ -24,12 +25,12 @@ const (
 
 // ToolSpec describes a single tool.
 type ToolSpec struct {
-	Name         string
-	Description  string
-	InputSchema  map[string]interface{}
-	Handler      func(input map[string]interface{}) (string, error)
-	Aliases      []string
-	Permission   PermissionLevel
+	Name        string
+	Description string
+	InputSchema map[string]interface{}
+	Handler     func(input map[string]interface{}) (string, error)
+	Aliases     []string
+	Permission  PermissionLevel
 }
 
 // ToolRegistry manages all available tools.
@@ -39,6 +40,14 @@ type ToolRegistry struct {
 
 // globalRegistry is the singleton used by ToolSearch.
 var globalRegistry *ToolRegistry
+
+// globalSandbox is the sandbox used for command execution.
+var globalSandbox *sandbox.Sandbox
+
+// SetSandbox sets the global sandbox for tool execution.
+func SetSandbox(sb *sandbox.Sandbox) {
+	globalSandbox = sb
+}
 
 // NewToolRegistry creates a registry with all built-in tools.
 func NewToolRegistry() *ToolRegistry {
@@ -65,8 +74,6 @@ func NewToolRegistry() *ToolRegistry {
 
 	// Notebook
 	r.register(notebookEditTool())
-
-
 
 	// Misc
 	r.register(sleepTool())
@@ -104,7 +111,27 @@ func (r *ToolRegistry) Execute(toolName string, input map[string]interface{}) (s
 	if !ok {
 		return "", fmt.Errorf("unknown tool: %s", toolName)
 	}
+
+	// Sandbox path validation for file tools
+	if globalSandbox != nil && globalSandbox.IsEnabled() {
+		if path := extractPath(input); path != "" {
+			if err := globalSandbox.ValidatePath(path); err != nil {
+				return "", err
+			}
+		}
+	}
+
 	return spec.Handler(input)
+}
+
+// extractPath extracts a file path from tool input.
+func extractPath(input map[string]interface{}) string {
+	for _, key := range []string{"path", "file_path", "directory"} {
+		if s, ok := input[key].(string); ok && s != "" {
+			return s
+		}
+	}
+	return ""
 }
 
 // AvailableTools returns tool definitions for the API.
@@ -125,16 +152,18 @@ type ToolFilter struct {
 	allowed map[string]bool
 }
 
-// ReadOnlyFilter returns a filter that only allows read-only tools.
+// Agent tool filters matching the Rust version's 6 agent types.
+
+// ReadOnlyFilter returns a filter for Explore-type agents (read-only tools only).
 func ReadOnlyFilter() *ToolFilter {
-	readOnlyTools := []string{
+	names := []string{
 		"read_file", "glob", "grep", "WebFetch", "WebSearch",
-		"ToolSearch", "TodoWrite", "Skill", "NotebookEdit",
-		"SendUserMessage", "sleep",
+		"ToolSearch", "Skill", "NotebookEdit",
+		"SendUserMessage", "sleep", "StructuredOutput",
 	}
 	f := &ToolFilter{allowed: make(map[string]bool)}
-	for _, name := range readOnlyTools {
-		f.allowed[name] = true
+	for _, n := range names {
+		f.allowed[n] = true
 	}
 	return f
 }
@@ -143,16 +172,81 @@ func ReadOnlyFilter() *ToolFilter {
 func ReadOnlyWithAgentFilter() *ToolFilter {
 	f := ReadOnlyFilter()
 	f.allowed["Agent"] = true
+	f.allowed["TodoWrite"] = true
 	return f
 }
 
-// AllToolsFilter returns a filter that allows everything.
+// VerificationFilter returns a filter for Verification agents: bash + read-only, no write/edit.
+func VerificationFilter() *ToolFilter {
+	f := ReadOnlyFilter()
+	f.allowed["bash"] = true
+	f.allowed["PowerShell"] = true
+	f.allowed["TodoWrite"] = true
+	return f
+}
+
+// ClawGuideFilter returns a filter for claw-guide agents: read-only + SendUserMessage.
+func ClawGuideFilter() *ToolFilter {
+	f := ReadOnlyFilter()
+	f.allowed["SendUserMessage"] = true
+	return f
+}
+
+// StatuslineSetupFilter returns a filter for statusline-setup agents: bash + read + write + edit.
+func StatuslineSetupFilter() *ToolFilter {
+	names := []string{
+		"bash", "read_file", "write_file", "edit_file",
+		"glob", "grep", "ToolSearch",
+	}
+	f := &ToolFilter{allowed: make(map[string]bool)}
+	for _, n := range names {
+		f.allowed[n] = true
+	}
+	return f
+}
+
+// AllToolsFilter returns a filter that allows everything (nil = no filtering).
 func AllToolsFilter() *ToolFilter {
-	return nil // nil means no filtering
+	return nil
+}
+
+// FilterForAgentType returns the appropriate tool filter for the given agent type.
+func FilterForAgentType(agentType string) *ToolFilter {
+	switch agentType {
+	case "Explore":
+		return ReadOnlyFilter()
+	case "Plan":
+		return ReadOnlyWithAgentFilter()
+	case "Verification":
+		return VerificationFilter()
+	case "claw-guide":
+		return ClawGuideFilter()
+	case "statusline-setup":
+		return StatuslineSetupFilter()
+	default: // "general-purpose" and unknown
+		return AllToolsFilter()
+	}
+}
+
+// MaxIterationsForAgent returns the default max iterations for an agent type.
+func MaxIterationsForAgent(agentType string) int {
+	switch agentType {
+	case "Explore":
+		return 5
+	case "Plan":
+		return 3
+	case "Verification":
+		return 10
+	case "claw-guide":
+		return 8
+	case "statusline-setup":
+		return 10
+	default:
+		return 32
+	}
 }
 
 // FilterTools returns tool definitions filtered by the given filter.
-// If filter is nil, all tools are returned.
 func (r *ToolRegistry) FilterTools(filter *ToolFilter) []api.ToolDefinition {
 	if filter == nil {
 		return r.AvailableTools()
@@ -203,6 +297,7 @@ func bashTool() *ToolSpec {
 				"timeout":     map[string]interface{}{"type": "integer", "description": "Timeout in milliseconds (default 120000)"},
 				"description": map[string]interface{}{"type": "string", "description": "What this command does"},
 				"run_in_background": map[string]interface{}{"type": "boolean", "description": "Run in background"},
+				"dangerouslyDisableSandbox": map[string]interface{}{"type": "boolean", "description": "Disable sandbox for this command"},
 			},
 			"required": []string{"command"},
 		},
@@ -215,6 +310,17 @@ func bashTool() *ToolSpec {
 			runBg := false
 			if b, ok := input["run_in_background"].(bool); ok {
 				runBg = b
+			}
+			sandboxOff := false
+			if b, ok := input["dangerouslyDisableSandbox"].(bool); ok {
+				sandboxOff = b
+			}
+
+			// Sandbox command validation
+			if globalSandbox != nil && globalSandbox.IsEnabled() && !sandboxOff {
+				if err := globalSandbox.ValidateCommand(cmd); err != nil {
+					return "", err
+				}
 			}
 
 			ctx, cancel := context.WithTimeout(context.Background(), time.Duration(timeoutMs)*time.Millisecond)

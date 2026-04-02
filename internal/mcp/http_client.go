@@ -59,7 +59,7 @@ func (c *HTTPClient) Initialize(ctx context.Context) error {
 
 	// Send initialize via HTTP POST
 	params := map[string]interface{}{
-		"protocolVersion": "2024-11-05",
+		"protocolVersion": "2025-03-26",
 		"capabilities":    map[string]interface{}{},
 		"clientInfo": map[string]interface{}{
 			"name":    "claw-code-go",

@@ -7,11 +7,12 @@ import (
 	"io"
 	"net/http"
 	"os"
+	"path/filepath"
 	"strings"
 	"time"
 
-	"github.com/ergochat/readline"
 	tea "github.com/charmbracelet/bubbletea"
+	"github.com/ergochat/readline"
 
 	"github.com/go-claw/claw/internal/api"
 	clawauth "github.com/go-claw/claw/internal/auth"
@@ -27,7 +28,7 @@ import (
 	"github.com/go-claw/claw/internal/tui"
 )
 
-const version = "0.4.0" // kept for local use; commands.Version is authoritative
+const version = "0.5.0"
 
 func main() {
 	if err := run(); err != nil {
@@ -51,6 +52,11 @@ func run() error {
 		showPrompt  bool
 		showConfig  bool
 		doAuth      bool
+		doLogout    bool
+		doInit      bool
+		showAgents  bool
+		showSkills  bool
+		dumpTools   bool
 		mcpFlag     string
 	)
 
@@ -66,13 +72,19 @@ func run() error {
 	fs.StringVar(&lspFlag, "lsp", "", "Connect to LSP server (command)")
 	fs.BoolVar(&showVersion, "version", false, "Print version")
 	fs.BoolVar(&showPrompt, "system-prompt", false, "Print system prompt")
-	fs.BoolVar(&doAuth, "auth", false, "Run OAuth authentication flow")
+	fs.BoolVar(&doAuth, "login", false, "Run OAuth authentication flow")
+	fs.BoolVar(&doLogout, "logout", false, "Clear stored OAuth tokens")
+	fs.BoolVar(&doInit, "init", false, "Initialize project configuration")
+	fs.BoolVar(&showAgents, "agents", false, "List available agent types")
+	fs.BoolVar(&showSkills, "skills", false, "List discovered skills")
+	fs.BoolVar(&dumpTools, "dump-tools", false, "Print all tool definitions as JSON")
 	fs.StringVar(&mcpFlag, "mcp", "", "Connect to MCP server (name from config)")
 	fs.BoolVar(&showConfig, "show-config", false, "Show configuration sources")
 	fs.Parse(os.Args[1:])
 
+	// One-shot subcommands
 	if showVersion {
-		fmt.Printf("Claw Code (Go) v%s\n  Phase: 4 (LSP + HTTP Server + Sandbox + Plugins)\n", version)
+		fmt.Printf("Claw Code (Go) v%s\n", version)
 		return nil
 	}
 
@@ -85,6 +97,27 @@ func run() error {
 		return runAuth()
 	}
 
+	if doLogout {
+		return runLogout()
+	}
+
+	if doInit {
+		_, err := cmdInitProject()
+		return err
+	}
+
+	if showAgents {
+		return listAgentTypes()
+	}
+
+	if showSkills {
+		return listSkills()
+	}
+
+	if dumpTools {
+		return dumpToolManifests()
+	}
+
 	if showConfig {
 		fmt.Println("Configuration sources:")
 		fmt.Print(config.DescribeSources())
@@ -95,6 +128,7 @@ func run() error {
 		fmt.Printf("\nEffective config:\n")
 		fmt.Printf("  Model: %s\n", cfg.Model)
 		fmt.Printf("  Permission mode: %s\n", cfg.PermissionMode)
+		fmt.Printf("  Sandbox: enabled=%v\n", cfg.Sandbox.Enabled)
 		fmt.Printf("  Pre-tool hooks: %d\n", len(cfg.Hooks.PreToolUse))
 		fmt.Printf("  Post-tool hooks: %d\n", len(cfg.Hooks.PostToolUse))
 		fmt.Printf("  MCP servers: %d\n", len(cfg.MCPServers))
@@ -150,6 +184,24 @@ func run() error {
 	// Create tools
 	toolReg := tools.NewToolRegistry()
 
+	// Setup sandbox (wired into tools)
+	if sandboxFlag || cfg.Sandbox.Enabled {
+		sbCfg := sandbox.Config{
+			Enabled:    true,
+			AllowPaths: cfg.Sandbox.AllowPaths,
+			AllowNet:   cfg.Sandbox.AllowNet,
+		}
+		if len(sbCfg.AllowPaths) == 0 {
+			sbCfg.AllowPaths = []string{"."}
+		}
+		if cfg.Sandbox.Isolation > 0 {
+			sbCfg.IsolationLevel = cfg.Sandbox.Isolation
+		}
+		sb := sandbox.New(sbCfg)
+		tools.SetSandbox(sb)
+		fmt.Fprintf(os.Stderr, "  [sandbox enabled, isolation=%d]\n", sb.IsolationLevel())
+	}
+
 	// Connect MCP servers from config
 	mcpClients := connectMCPServers(cfg)
 	for _, mc := range mcpClients {
@@ -162,32 +214,36 @@ func run() error {
 		}
 	}
 
-	// Discover plugins
+	// Discover and wire plugins with real execution
 	pluginMgr := plugins.NewManager()
 	pluginMgr.Discover()
 	pluginTools := pluginMgr.AllTools()
 	for _, t := range pluginTools {
 		toolName := t.Name
+		plugin := pluginMgr.GetPluginForTool(toolName)
 		toolReg.RegisterDynamic(toolName, t.Description, t.InputSchema, func(input map[string]interface{}) (string, error) {
-			return "", fmt.Errorf("plugin tool execution not yet implemented for %s", toolName)
+			if plugin != nil && plugin.Command != "" {
+				return plugins.ExecutePluginTool(plugin.Command, input)
+			}
+			return "", fmt.Errorf("plugin tool %s has no execution command", toolName)
 		})
-	}
-
-	// Sandbox
-	if sandboxFlag {
-		sandboxCfg := sandbox.Config{Enabled: true, AllowPaths: []string{"."}}
-		sb := sandbox.New(sandboxCfg)
-		_ = sb
-		fmt.Fprintf(os.Stderr, "  [sandbox enabled]\n")
 	}
 
 	// Hook runner
 	allPre := append([]string{}, cfg.Hooks.PreToolUse...)
 	allPost := append([]string{}, cfg.Hooks.PostToolUse...)
+	// Add plugin hooks
+	pluginHooks := pluginMgr.AllHooks()
+	allPre = append(allPre, pluginHooks.PreToolUse...)
+	allPost = append(allPost, pluginHooks.PostToolUse...)
 
 	// Create runtime
 	rt := runtime.NewConversationRuntime(provider, toolReg, model)
 	rt.SetHooks(runtime.NewHookRunner(allPre, allPost))
+
+	// Wire usage tracker into commands
+	commands.SetUsageTracker(rt.Usage())
+
 	// Wire agent runtime for sub-agent execution
 	tools.SetAgentRuntime(rt)
 
@@ -229,6 +285,9 @@ func runOnce(rt *runtime.ConversationRuntime, prompt string, format string) erro
 
 	if usage != nil {
 		fmt.Fprintf(os.Stderr, "\n  tokens: in=%d out=%d\n", usage.InputTokens, usage.OutputTokens)
+		if rt.Usage() != nil {
+			fmt.Fprintf(os.Stderr, "  cost: %s\n", rt.Usage().FormatCost())
+		}
 	}
 	return nil
 }
@@ -244,6 +303,16 @@ func runREPL(rt *runtime.ConversationRuntime, cfg *config.Config) error {
 	fmt.Println("  Claw Code (Go) v" + version)
 	fmt.Printf("  Model: %s\n", rt.Model())
 	fmt.Printf("  Permission: %s\n", cfg.PermissionMode)
+
+	// Show remote context
+	ctx := runtime.DetectRemoteContext()
+	if ctx.IsRemote {
+		fmt.Printf("  Remote: %s\n", ctx.SessionType)
+	}
+	if sandbox.IsContainer() {
+		fmt.Println("  Container: detected")
+	}
+
 	fmt.Println("  Type /help for commands, Ctrl+D to exit")
 	fmt.Println()
 
@@ -283,6 +352,16 @@ func runREPL(rt *runtime.ConversationRuntime, cfg *config.Config) error {
 			if err != nil {
 				fmt.Fprintf(os.Stderr, "error: %v\n", err)
 			} else if output != "" {
+				// Handle special command outputs
+				if strings.HasPrefix(output, "RESUME:") {
+					sessionPath := strings.TrimPrefix(output, "RESUME:")
+					if err := resumeSession(rt, sessionPath); err != nil {
+						fmt.Fprintf(os.Stderr, "  resume error: %v\n", err)
+					} else {
+						fmt.Printf("  Resumed session: %s (%d messages)\n", sessionPath, rt.MessageCount())
+					}
+					continue
+				}
 				fmt.Println(output)
 			}
 			if cmd.Name == "compact" {
@@ -293,6 +372,10 @@ func runREPL(rt *runtime.ConversationRuntime, cfg *config.Config) error {
 					fmt.Println("Not enough messages to compact.")
 				}
 			}
+			if cmd.Name == "clear" {
+				rt.Clear()
+				fmt.Println("Session cleared.")
+			}
 			continue
 		}
 
@@ -302,9 +385,13 @@ func runREPL(rt *runtime.ConversationRuntime, cfg *config.Config) error {
 			fmt.Fprintf(os.Stderr, "  [auto-compacted, messages: %d]\n", rt.MessageCount())
 		}
 
+		// Auto-save session
+		os.MkdirAll(".claw-sessions", 0755)
+		sessionFile := filepath.Join(".claw-sessions", fmt.Sprintf("session-%d.json", time.Now().Unix()))
+
 		// Run turn
-		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
-		outputs, usage, err := rt.RunTurn(ctx, line)
+		turnCtx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
+		outputs, usage, err := rt.RunTurn(turnCtx, line)
 		cancel()
 
 		if err != nil {
@@ -326,11 +413,27 @@ func runREPL(rt *runtime.ConversationRuntime, cfg *config.Config) error {
 		}
 
 		if usage != nil {
-			fmt.Fprintf(os.Stderr, "  \033[90mtokens: in=%d out=%d\033[0m\n", usage.InputTokens, usage.OutputTokens)
+			cost := ""
+			if rt.Usage() != nil {
+				cost = fmt.Sprintf(" cost=%s", rt.Usage().FormatCost())
+			}
+			fmt.Fprintf(os.Stderr, "  \033[90mtokens: in=%d out=%d%s\033[0m\n", usage.InputTokens, usage.OutputTokens, cost)
 		}
 		fmt.Println()
+
+		// Save session
+		rt.SaveSession(sessionFile)
 	}
 
+	return nil
+}
+
+func resumeSession(rt *runtime.ConversationRuntime, path string) error {
+	session, err := runtime.LoadSession(path)
+	if err != nil {
+		return fmt.Errorf("failed to load session: %w", err)
+	}
+	rt.SetSession(session)
 	return nil
 }
 
@@ -344,6 +447,87 @@ func runAuth() error {
 		return fmt.Errorf("failed to save token: %w", err)
 	}
 	fmt.Println("Authentication successful! Token saved.")
+	return nil
+}
+
+func runLogout() error {
+	home, _ := os.UserHomeDir()
+	tokenPath := filepath.Join(home, ".claw", "oauth_token.json")
+	if err := os.Remove(tokenPath); err != nil {
+		return fmt.Errorf("no stored token found")
+	}
+	fmt.Println("Logged out. Token removed.")
+	return nil
+}
+
+func cmdInitProject() (string, error) {
+	if err := os.MkdirAll(".claw", 0755); err != nil {
+		return "", err
+	}
+	created := []string{}
+	settingsFile := ".claw/settings.json"
+	if _, err := os.Stat(settingsFile); err != nil {
+		content := `{
+  "model": "",
+  "permissionMode": "danger-full-access",
+  "hooks": { "PreToolUse": [], "PostToolUse": [] }
+}`
+		if err := os.WriteFile(settingsFile, []byte(content), 0644); err != nil {
+			return "", err
+		}
+		created = append(created, settingsFile)
+	}
+	if _, err := os.Stat("CLAUDE.md"); err != nil {
+		if err := os.WriteFile("CLAUDE.md", []byte("# Project Instructions\n"), 0644); err != nil {
+			return "", err
+		}
+		created = append(created, "CLAUDE.md")
+	}
+	if len(created) == 0 {
+		return "Already initialized.", nil
+	}
+	return "Created: " + strings.Join(created, ", "), nil
+}
+
+func listAgentTypes() error {
+	types := []struct {
+		Name        string
+		Tools       string
+		MaxIter     int
+	}{
+		{"Explore", "read-only", 5},
+		{"Plan", "read-only + Agent + Todo", 3},
+		{"Verification", "bash + read-only (no write/edit)", 10},
+		{"claw-guide", "read-only + SendUserMessage", 8},
+		{"statusline-setup", "bash + read + write + edit", 10},
+		{"general-purpose", "all tools", 32},
+	}
+	fmt.Println("Agent types:")
+	for _, t := range types {
+		fmt.Printf("  %-20s tools=%-35s maxIter=%d\n", t.Name, t.Tools, t.MaxIter)
+	}
+	return nil
+}
+
+func listSkills() error {
+	skills := tools.DiscoverSkills()
+	if len(skills) == 0 {
+		fmt.Println("No skills found. Create in .claw/skills/ or ~/.claw/skills/")
+		return nil
+	}
+	fmt.Println("Available skills:")
+	for _, s := range skills {
+		fmt.Printf("  - %s\n", s)
+	}
+	return nil
+}
+
+func dumpToolManifests() error {
+	toolReg := tools.NewToolRegistry()
+	defs := toolReg.AvailableTools()
+	for _, d := range defs {
+		fmt.Printf("--- %s ---\n%s\n\n", d.Name, d.Description)
+	}
 	return nil
 }
 
@@ -375,7 +559,17 @@ func runMCP(name string, cfg *config.Config) error {
 		return fmt.Errorf("MCP server '%s' not found in config", name)
 	}
 
-	client, err := mcp.NewClient(context.Background(), srv.Command, []string{}, srv.Env)
+	// Support different transport types
+	switch srv.Type {
+	case "sse", "http":
+		return runMCPHTTP(name, srv)
+	default: // stdio
+		return runMCPStdio(name, srv)
+	}
+}
+
+func runMCPStdio(name string, srv config.MCPServer) error {
+	client, err := mcp.NewClient(context.Background(), srv.Command, srv.Args, srv.Env)
 	if err != nil {
 		return fmt.Errorf("failed to start MCP server: %w", err)
 	}
@@ -391,6 +585,29 @@ func runMCP(name string, cfg *config.Config) error {
 	}
 
 	fmt.Printf("MCP server '%s' (%s v%s) connected with %d tools:\n", name, client.ServerInfo().Name, client.ServerInfo().Version, len(mcpTools))
+	for _, t := range mcpTools {
+		fmt.Printf("  - %s: %s\n", t.Name, t.Description)
+	}
+	return nil
+}
+
+func runMCPHTTP(name string, srv config.MCPServer) error {
+	client, err := mcp.NewHTTPClient(srv.URL, srv.Headers)
+	if err != nil {
+		return fmt.Errorf("failed to create HTTP MCP client: %w", err)
+	}
+	defer client.Close()
+
+	if err := client.Initialize(context.Background()); err != nil {
+		return fmt.Errorf("MCP HTTP init failed: %w", err)
+	}
+
+	mcpTools, err := client.ListTools(context.Background())
+	if err != nil {
+		return fmt.Errorf("failed to list tools: %w", err)
+	}
+
+	fmt.Printf("MCP server '%s' (HTTP) connected with %d tools:\n", name, len(mcpTools))
 	for _, t := range mcpTools {
 		fmt.Printf("  - %s: %s\n", t.Name, t.Description)
 	}
@@ -419,18 +636,24 @@ func runProxy(apiAuth *api.AuthSource, baseURL string, port int) error {
 func connectMCPServers(cfg *config.Config) []*mcp.Client {
 	var clients []*mcp.Client
 	for name, srv := range cfg.MCPServers {
-		client, err := mcp.NewClient(context.Background(), srv.Command, []string{}, srv.Env)
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "  [MCP] Failed to connect %s: %v\n", name, err)
-			continue
+		switch srv.Type {
+		case "sse", "http":
+			// HTTP/SSE clients handled separately in MCP mode
+			fmt.Fprintf(os.Stderr, "  [MCP] Skipping HTTP server '%s' (use --mcp flag)\n", name)
+		default: // stdio
+			client, err := mcp.NewClient(context.Background(), srv.Command, srv.Args, srv.Env)
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "  [MCP] Failed to connect %s: %v\n", name, err)
+				continue
+			}
+			if err := client.Initialize(context.Background()); err != nil {
+				fmt.Fprintf(os.Stderr, "  [MCP] Init failed for %s: %v\n", name, err)
+				client.Close()
+				continue
+			}
+			fmt.Fprintf(os.Stderr, "  [MCP] Connected: %s (%s)\n", name, client.ServerInfo().Name)
+			clients = append(clients, client)
 		}
-		if err := client.Initialize(context.Background()); err != nil {
-			fmt.Fprintf(os.Stderr, "  [MCP] Init failed for %s: %v\n", name, err)
-			client.Close()
-			continue
-		}
-		fmt.Fprintf(os.Stderr, "  [MCP] Connected: %s (%s)\n", name, client.ServerInfo().Name)
-		clients = append(clients, client)
 	}
 	return clients
 }

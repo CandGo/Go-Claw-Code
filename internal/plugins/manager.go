@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -265,4 +266,34 @@ func (m *Manager) AllHooks() PluginHooks {
 		hooks.PostToolUse = append(hooks.PostToolUse, p.Hooks.PostToolUse...)
 	}
 	return hooks
+}
+
+// GetPluginForTool returns the plugin that owns the given tool name.
+func (m *Manager) GetPluginForTool(toolName string) *Plugin {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	for _, p := range m.plugins {
+		if !p.Enabled {
+			continue
+		}
+		for _, t := range p.Tools {
+			if t.Name == toolName {
+				return p
+			}
+		}
+	}
+	return nil
+}
+
+// ExecutePluginTool runs a plugin's command with the tool input as JSON stdin.
+func ExecutePluginTool(command string, input map[string]interface{}) (string, error) {
+	if command == "" {
+		return "", fmt.Errorf("plugin has no command configured")
+	}
+	payload, _ := json.Marshal(input)
+	parts := strings.Fields(command)
+	cmd := exec.Command(parts[0], parts[1:]...)
+	cmd.Stdin = strings.NewReader(string(payload))
+	out, err := cmd.CombinedOutput()
+	return string(out), err
 }

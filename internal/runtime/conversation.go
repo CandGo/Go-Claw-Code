@@ -21,6 +21,7 @@ type ConversationRuntime struct {
 	session      *Session
 	policy       PermissionPolicy
 	hooks        *HookRunner
+	usage        *UsageTracker
 	model        string
 	maxIter      int
 	systemPrompt string
@@ -34,6 +35,7 @@ func NewConversationRuntime(provider api.Provider, tools ToolExecutor, model str
 		session:      NewSession(),
 		policy:       DefaultPermissionPolicy(),
 		hooks:        NewHookRunner(nil, nil),
+		usage:        NewUsageTracker(model),
 		model:        model,
 		maxIter:      50,
 		systemPrompt: DefaultSystemPrompt(),
@@ -43,6 +45,36 @@ func NewConversationRuntime(provider api.Provider, tools ToolExecutor, model str
 // SetHooks sets the hook runner for the conversation runtime.
 func (rt *ConversationRuntime) SetHooks(hooks *HookRunner) {
 	rt.hooks = hooks
+}
+
+// SetSession replaces the current session (used for resume).
+func (rt *ConversationRuntime) SetSession(s *Session) {
+	rt.session = s
+}
+
+// Model returns the current model name.
+func (rt *ConversationRuntime) Model() string {
+	return rt.model
+}
+
+// MessageCount returns the number of messages in the session.
+func (rt *ConversationRuntime) MessageCount() int {
+	return len(rt.session.Messages)
+}
+
+// Clear resets the conversation session.
+func (rt *ConversationRuntime) Clear() {
+	rt.session = NewSession()
+}
+
+// Usage returns the usage tracker.
+func (rt *ConversationRuntime) Usage() *UsageTracker {
+	return rt.usage
+}
+
+// SaveSession persists the session to a file.
+func (rt *ConversationRuntime) SaveSession(path string) error {
+	return rt.session.Save(path)
 }
 
 // ShouldCompact checks if the session needs compaction.
@@ -92,8 +124,16 @@ func (rt *ConversationRuntime) RunTurn(ctx context.Context, prompt string) ([]Tu
 
 		totalUsage.InputTokens += usage.InputTokens
 		totalUsage.OutputTokens += usage.OutputTokens
-	totalUsage.CacheCreationInputTokens += usage.CacheCreationInputTokens
-	totalUsage.CacheReadInputTokens += usage.CacheReadInputTokens
+		totalUsage.CacheCreationInputTokens += usage.CacheCreationInputTokens
+		totalUsage.CacheReadInputTokens += usage.CacheReadInputTokens
+
+		// Record in usage tracker
+		rt.usage.Record(TokenUsage{
+			InputTokens:              usage.InputTokens,
+			OutputTokens:             usage.OutputTokens,
+			CacheCreationInputTokens: usage.CacheCreationInputTokens,
+			CacheReadInputTokens:     usage.CacheReadInputTokens,
+		})
 
 		// Convert events to output
 		var textParts []string
@@ -235,49 +275,49 @@ func (rt *ConversationRuntime) buildRequest() *api.MessageRequest {
 	}
 
 	sysPrompt, _ := json.Marshal(rt.systemPrompt)
-	tools := rt.tools.AvailableTools()
+	toolDefs := rt.tools.AvailableTools()
 
 	return &api.MessageRequest{
 		Model:      rt.model,
 		MaxTokens:  api.MaxTokensForModel(rt.model),
 		Messages:   msgs,
 		System:     sysPrompt,
-		Tools:      tools,
+		Tools:      toolDefs,
 		ToolChoice: api.AutoToolChoice(),
 	}
 }
 
 // filterToolsForAgent returns a filtered ToolExecutor based on agent type.
-// Explore agents get read-only tools, Plan agents get read-only + Agent,
-// all others get full access.
-func filterToolsForAgent(tools ToolExecutor, agentType string) ToolExecutor {
-	type filterable interface {
-		FilteredRegistry(filter interface{}) ToolExecutor
-	}
-
+func filterToolsForAgent(te ToolExecutor, agentType string) ToolExecutor {
 	readOnlyTools := map[string]bool{
 		"read_file": true, "glob": true, "grep": true,
 		"WebFetch": true, "WebSearch": true,
 		"ToolSearch": true, "Skill": true,
 		"NotebookEdit": true, "SendUserMessage": true,
-		"sleep": true, "TodoWrite": true,
-	}
-
-	// Add Agent for Plan type
-	if agentType == "Plan" || agentType == "general-purpose" {
-		readOnlyTools["Agent"] = true
+		"sleep": true, "TodoWrite": true, "StructuredOutput": true,
 	}
 
 	switch agentType {
 	case "Explore":
-		// Read-only subset only
-	case "Plan", "general-purpose":
-		// Read-only + Agent
+		// readOnlyTools only
+	case "Plan":
+		readOnlyTools["Agent"] = true
+		readOnlyTools["TodoWrite"] = true
+	case "Verification":
+		readOnlyTools["bash"] = true
+		readOnlyTools["PowerShell"] = true
+	case "claw-guide":
+		// read-only + SendUserMessage (already included)
+	case "statusline-setup":
+		readOnlyTools = map[string]bool{
+			"bash": true, "read_file": true, "write_file": true,
+			"edit_file": true, "glob": true, "grep": true, "ToolSearch": true,
+		}
 	default:
-		return nil // no filtering
+		return nil // no filtering for general-purpose
 	}
 
-	return &filteredToolExecutor{inner: tools, allowed: readOnlyTools}
+	return &filteredToolExecutor{inner: te, allowed: readOnlyTools}
 }
 
 // filteredToolExecutor wraps a ToolExecutor and filters available tools.
@@ -313,10 +353,7 @@ func joinStrings(parts []string) string {
 }
 
 // ExecuteSubAgent runs a sub-agent with its own isolated session.
-// It creates a new conversation runtime with the same provider and tools
-// but a fresh session, and runs the given prompt for up to maxIterations.
-// agentType controls tool filtering: "Explore" gets read-only tools,
-// "Plan" gets read-only + Agent tools, others get all tools.
+// agentType controls tool filtering using FilterForAgentType.
 func (rt *ConversationRuntime) ExecuteSubAgent(ctx context.Context, prompt string, maxIterations int, agentType string) (string, error) {
 	// Apply tool filtering based on agent type
 	toolExec := rt.tools
@@ -330,6 +367,7 @@ func (rt *ConversationRuntime) ExecuteSubAgent(ctx context.Context, prompt strin
 		session:      NewSession(),
 		policy:       rt.policy,
 		hooks:        rt.hooks,
+		usage:        NewUsageTracker(rt.model),
 		model:        rt.model,
 		maxIter:      maxIterations,
 		systemPrompt: rt.systemPrompt,

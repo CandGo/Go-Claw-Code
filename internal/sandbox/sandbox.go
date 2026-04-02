@@ -288,3 +288,27 @@ func (s *Sandbox) NetworkIsolated() bool {
 func (s *Sandbox) IsolationLevel() int {
 	return s.isolationLevel
 }
+
+// IsContainer checks if the process is running inside a container.
+func IsContainer() bool {
+	if _, err := os.Stat("/.dockerenv"); err == nil {
+		return true
+	}
+	for _, env := range []string{"CONTAINER", "DOCKER", "PODMAN"} {
+		if os.Getenv(env) == "true" || os.Getenv(env) == "1" {
+			return true
+		}
+	}
+	if os.Getenv("KUBERNETES_SERVICE_HOST") != "" {
+		return true
+	}
+	if data, err := os.ReadFile("/proc/1/cgroup"); err == nil {
+		content := string(data)
+		for _, indicator := range []string{"docker", "containerd", "kubepods", "podman"} {
+			if strings.Contains(content, indicator) {
+				return true
+			}
+		}
+	}
+	return false
+}

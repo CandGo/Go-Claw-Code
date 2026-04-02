@@ -52,7 +52,7 @@ func agentTool() *ToolSpec {
 			"properties": map[string]interface{}{
 				"description":   map[string]interface{}{"type": "string", "description": "Short description of the task"},
 				"prompt":        map[string]interface{}{"type": "string", "description": "The full task prompt"},
-				"subagent_type": map[string]interface{}{"type": "string", "description": "Agent type: general-purpose, Explore, Plan"},
+				"subagent_type": map[string]interface{}{"type": "string", "description": "Agent type: general-purpose, Explore, Plan, Verification, claw-guide, statusline-setup"},
 				"name":          map[string]interface{}{"type": "string", "description": "Optional agent name"},
 				"model":         map[string]interface{}{"type": "string", "description": "Model override"},
 			},
@@ -91,12 +91,7 @@ func agentTool() *ToolSpec {
 				ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
 				defer cancel()
 
-				maxIter := 10
-				if agentType == "Explore" {
-					maxIter = 5
-				} else if agentType == "Plan" {
-					maxIter = 3
-				}
+				maxIter := MaxIterationsForAgent(agentType)
 
 				output, err := agentRuntime.ExecuteSubAgent(ctx, prompt, maxIter, agentType)
 

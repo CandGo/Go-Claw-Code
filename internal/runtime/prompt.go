@@ -335,16 +335,3 @@ func writeInstructionFiles(buf *strings.Builder, cwd string) {
 	}
 }
 
-// ConversationRuntime methods
-
-func (rt *ConversationRuntime) Model() string {
-	return rt.model
-}
-
-func (rt *ConversationRuntime) MessageCount() int {
-	return len(rt.session.Messages)
-}
-
-func (rt *ConversationRuntime) Clear() {
-	rt.session = NewSession()
-}

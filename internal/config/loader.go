@@ -25,13 +25,15 @@ type HookConfig struct {
 	PostToolUse []string `json:"PostToolUse,omitempty"`
 }
 
-// MCPServer describes an MCP server connection.
+// MCPServer describes an MCP server connection with full transport support.
 type MCPServer struct {
-	Type    string                 `json:"type"` // stdio, sse, http, ws
-	Command string                 `json:"command,omitempty"`
-	URL     string                 `json:"url,omitempty"`
-	Env     map[string]string      `json:"env,omitempty"`
-	Config  map[string]interface{} `json:"config,omitempty"`
+	Type    string            `json:"type"`              // stdio, sse, http, ws, sdk, managed-proxy
+	Command string            `json:"command,omitempty"` // stdio: command to spawn
+	Args    []string          `json:"args,omitempty"`    // stdio: command arguments
+	URL     string            `json:"url,omitempty"`     // sse/http/ws: server URL
+	Headers map[string]string `json:"headers,omitempty"` // sse/http/ws: auth headers
+	Env     map[string]string `json:"env,omitempty"`     // stdio: environment variables
+	Config  map[string]interface{} `json:"config,omitempty"` // transport-specific config
 }
 
 // PluginConfig holds plugin settings.
@@ -41,7 +43,10 @@ type PluginConfig struct {
 
 // SandboxConfig holds sandbox settings.
 type SandboxConfig struct {
-	Enabled bool `json:"enabled,omitempty"`
+	Enabled    bool     `json:"enabled,omitempty"`
+	AllowNet   bool     `json:"allowNet,omitempty"`
+	AllowPaths []string `json:"allowPaths,omitempty"`
+	Isolation  int      `json:"isolation,omitempty"` // 1=path, 2=env, 3=namespace
 }
 
 // ConfigSource identifies where a config value came from.
@@ -55,11 +60,12 @@ const (
 	SourceLocal
 )
 
-// Load discovers and merges configuration from all layers.
+// Load discovers and merges configuration from all layers using deep merge.
 func Load() (*Config, error) {
 	cfg := &Config{
 		PermissionMode: "danger-full-access",
 		MCPServers:     make(map[string]MCPServer),
+		Settings:       make(map[string]interface{}),
 	}
 
 	layers := discoverLayers()
@@ -73,7 +79,7 @@ func Load() (*Config, error) {
 		if err := json.Unmarshal(data, &raw); err != nil {
 			continue
 		}
-		mergeInto(cfg, raw)
+		deepMergeInto(cfg, raw)
 	}
 
 	// Apply environment variable overrides
@@ -85,6 +91,22 @@ func Load() (*Config, error) {
 	}
 	if p := os.Getenv("CLAW_PERMISSION_MODE"); p != "" {
 		cfg.PermissionMode = p
+	}
+	if m := os.Getenv("CLAW_SANDBOX_ENABLED"); m == "true" || m == "1" {
+		cfg.Sandbox.Enabled = true
+	}
+	if m := os.Getenv("CLAW_SANDBOX_NETWORK"); m == "true" || m == "1" {
+		cfg.Sandbox.AllowNet = true
+	}
+	if m := os.Getenv("CLAW_SANDBOX_ISOLATION"); m != "" {
+		switch m {
+		case "path":
+			cfg.Sandbox.Isolation = 1
+		case "env":
+			cfg.Sandbox.Isolation = 2
+		case "namespace":
+			cfg.Sandbox.Isolation = 3
+		}
 	}
 
 	if cfg.Model == "" {
@@ -127,7 +149,9 @@ func discoverLayers() []configLayer {
 	return layers
 }
 
-func mergeInto(cfg *Config, raw map[string]interface{}) {
+// deepMergeInto performs a deep merge of raw config into cfg.
+// Nested maps are recursively merged; other values are overwritten.
+func deepMergeInto(cfg *Config, raw map[string]interface{}) {
 	if v, ok := raw["model"].(string); ok && v != "" {
 		cfg.Model = v
 	}
@@ -140,6 +164,8 @@ func mergeInto(cfg *Config, raw map[string]interface{}) {
 			cfg.PermissionMode = dm
 		}
 	}
+
+	// Deep merge hooks
 	if hooks, ok := raw["hooks"].(map[string]interface{}); ok {
 		if pre, ok := hooks["PreToolUse"].([]interface{}); ok {
 			for _, v := range pre {
@@ -156,24 +182,48 @@ func mergeInto(cfg *Config, raw map[string]interface{}) {
 			}
 		}
 	}
+
+	// Parse MCP servers with full transport support
 	if servers, ok := raw["mcp_servers"].(map[string]interface{}); ok {
 		for name, srv := range servers {
 			if sm, ok := srv.(map[string]interface{}); ok {
 				server := MCPServer{
-					Type:   strVal(sm, "type"),
+					Type:    strValDefault(sm, "type", "stdio"),
 					Command: strVal(sm, "command"),
-					URL:    strVal(sm, "url"),
+					URL:     strVal(sm, "url"),
 				}
+				// Parse args
+				if args, ok := sm["args"].([]interface{}); ok {
+					for _, a := range args {
+						if s, ok := a.(string); ok {
+							server.Args = append(server.Args, s)
+						}
+					}
+				}
+				// Parse headers
+				if headers, ok := sm["headers"].(map[string]interface{}); ok {
+					server.Headers = make(map[string]string)
+					for k, v := range headers {
+						server.Headers[k] = fmt.Sprintf("%v", v)
+					}
+				}
+				// Parse env
 				if env, ok := sm["env"].(map[string]interface{}); ok {
 					server.Env = make(map[string]string)
 					for k, v := range env {
 						server.Env[k] = fmt.Sprintf("%v", v)
 					}
 				}
+				// Keep raw config for transport-specific options
+				if cfg, ok := sm["config"].(map[string]interface{}); ok {
+					server.Config = cfg
+				}
 				cfg.MCPServers[name] = server
 			}
 		}
 	}
+
+	// Parse plugins
 	if plugins, ok := raw["plugins"].(map[string]interface{}); ok {
 		if enabled, ok := plugins["enabled"].([]interface{}); ok {
 			for _, v := range enabled {
@@ -183,11 +233,45 @@ func mergeInto(cfg *Config, raw map[string]interface{}) {
 			}
 		}
 	}
-	if sandbox, ok := raw["sandbox"].(map[string]interface{}); ok {
-		if v, ok := sandbox["enabled"].(bool); ok {
+
+	// Parse sandbox with full config
+	if sb, ok := raw["sandbox"].(map[string]interface{}); ok {
+		if v, ok := sb["enabled"].(bool); ok {
 			cfg.Sandbox.Enabled = v
 		}
+		if v, ok := sb["allowNet"].(bool); ok {
+			cfg.Sandbox.AllowNet = v
+		}
+		if v, ok := sb["allowPaths"].([]interface{}); ok {
+			for _, p := range v {
+				if s, ok := p.(string); ok {
+					cfg.Sandbox.AllowPaths = append(cfg.Sandbox.AllowPaths, s)
+				}
+			}
+		}
+		if v, ok := sb["isolation"].(float64); ok {
+			cfg.Sandbox.Isolation = int(v)
+		}
 	}
+
+	// Deep merge settings
+	if settings, ok := raw["settings"].(map[string]interface{}); ok {
+		cfg.Settings = deepMergeMaps(cfg.Settings, settings)
+	}
+}
+
+// deepMergeMaps recursively merges src into dst.
+func deepMergeMaps(dst, src map[string]interface{}) map[string]interface{} {
+	for k, v := range src {
+		if srcMap, ok := v.(map[string]interface{}); ok {
+			if dstMap, ok := dst[k].(map[string]interface{}); ok {
+				dst[k] = deepMergeMaps(dstMap, srcMap)
+				continue
+			}
+		}
+		dst[k] = v
+	}
+	return dst
 }
 
 func strVal(m map[string]interface{}, key string) string {
@@ -195,6 +279,13 @@ func strVal(m map[string]interface{}, key string) string {
 		return v
 	}
 	return ""
+}
+
+func strValDefault(m map[string]interface{}, key, def string) string {
+	if v, ok := m[key].(string); ok && v != "" {
+		return v
+	}
+	return def
 }
 
 // Save writes config to the project settings file.
@@ -217,9 +308,9 @@ func DescribeSources() string {
 	for _, layer := range layers {
 		name := [...]string{"User (.claw.json)", "User settings", "Project (.claw.json)", "Project settings", "Local overrides"}[layer.source]
 		if _, err := os.Stat(layer.path); err == nil {
-			fmt.Fprintf(&buf, "  ✓ %s: %s\n", name, layer.path)
+			fmt.Fprintf(&buf, "  [ok] %s: %s\n", name, layer.path)
 		} else {
-			fmt.Fprintf(&buf, "  ✗ %s: (not found)\n", name)
+			fmt.Fprintf(&buf, "  [--] %s: (not found)\n", name)
 		}
 	}
 	return buf.String()
