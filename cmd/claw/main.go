@@ -184,10 +184,12 @@ func run() error {
 	// Hook runner
 	allPre := append([]string{}, cfg.Hooks.PreToolUse...)
 	allPost := append([]string{}, cfg.Hooks.PostToolUse...)
-	_ = runtime.NewHookRunner(allPre, allPost)
 
 	// Create runtime
 	rt := runtime.NewConversationRuntime(provider, toolReg, model)
+	rt.SetHooks(runtime.NewHookRunner(allPre, allPost))
+	// Wire agent runtime for sub-agent execution
+	tools.SetAgentRuntime(rt)
 
 	// Determine prompt from args
 	args := fs.Args()

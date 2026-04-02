@@ -20,6 +20,7 @@ type ConversationRuntime struct {
 	tools        ToolExecutor
 	session      *Session
 	policy       PermissionPolicy
+	hooks        *HookRunner
 	model        string
 	maxIter      int
 	systemPrompt string
@@ -32,10 +33,16 @@ func NewConversationRuntime(provider api.Provider, tools ToolExecutor, model str
 		tools:        tools,
 		session:      NewSession(),
 		policy:       DefaultPermissionPolicy(),
+		hooks:        NewHookRunner(nil, nil),
 		model:        model,
 		maxIter:      50,
 		systemPrompt: DefaultSystemPrompt(),
 	}
+}
+
+// SetHooks sets the hook runner for the conversation runtime.
+func (rt *ConversationRuntime) SetHooks(hooks *HookRunner) {
+	rt.hooks = hooks
 }
 
 // ShouldCompact checks if the session needs compaction.
@@ -129,7 +136,7 @@ func (rt *ConversationRuntime) RunTurn(ctx context.Context, prompt string) ([]Tu
 			allOutputs = append(allOutputs, TurnOutput{Type: "text", Text: joinStrings(textParts)})
 		}
 
-		// Execute tools
+		// Execute tools (with pre/post hooks)
 		var toolResultBlocks []ContentBlock
 		for _, tc := range toolCalls {
 			allOutputs = append(allOutputs, TurnOutput{
@@ -138,10 +145,36 @@ func (rt *ConversationRuntime) RunTurn(ctx context.Context, prompt string) ([]Tu
 				ToolID:   tc.ID,
 			})
 
+			// Pre-tool hook: check if tool use is allowed
+			preResult := rt.hooks.RunPreToolUse(tc.Name, tc.Input)
+			if !preResult.Allowed {
+				blockedMsg := fmt.Sprintf("blocked by hook: %s", preResult.Message)
+				toolResultBlocks = append(toolResultBlocks, &ToolResultBlock{
+					ToolUseID: tc.ID,
+					Content:   blockedMsg,
+					IsError:   true,
+				})
+				allOutputs = append(allOutputs, TurnOutput{
+					Type:     "tool_result",
+					ToolName: tc.Name,
+					ToolID:   tc.ID,
+					Text:     blockedMsg,
+					IsError:  true,
+				})
+				continue
+			}
+
+			// Execute the tool
 			result, err := rt.tools.Execute(tc.Name, tc.Input)
 			isErr := err != nil
 			if isErr {
 				result = fmt.Sprintf("error: %v", err)
+			}
+
+			// Post-tool hook
+			postResult := rt.hooks.RunPostToolUse(tc.Name, tc.Input, result, isErr)
+			if postResult.Message != "" {
+				result += "\n[hook: " + postResult.Message + "]"
 			}
 
 			toolResultBlocks = append(toolResultBlocks, &ToolResultBlock{
@@ -221,4 +254,33 @@ func joinStrings(parts []string) string {
 		result += p
 	}
 	return result
+}
+
+// ExecuteSubAgent runs a sub-agent with its own isolated session.
+// It creates a new conversation runtime with the same provider and tools
+// but a fresh session, and runs the given prompt for up to maxIterations.
+func (rt *ConversationRuntime) ExecuteSubAgent(ctx context.Context, prompt string, maxIterations int) (string, error) {
+	subRt := &ConversationRuntime{
+		provider:     rt.provider,
+		tools:        rt.tools,
+		session:      NewSession(),
+		policy:       rt.policy,
+		hooks:        rt.hooks,
+		model:        rt.model,
+		maxIter:      maxIterations,
+		systemPrompt: rt.systemPrompt,
+	}
+
+	outputs, _, err := subRt.RunTurn(ctx, prompt)
+	if err != nil {
+		return "", err
+	}
+
+	var textParts []string
+	for _, out := range outputs {
+		if out.Type == "text" && out.Text != "" {
+			textParts = append(textParts, out.Text)
+		}
+	}
+	return joinStrings(textParts), nil
 }

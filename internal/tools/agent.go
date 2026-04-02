@@ -1,6 +1,7 @@
 package tools
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"os"
@@ -9,6 +10,18 @@ import (
 	"sync"
 	"time"
 )
+
+// AgentRuntime is a minimal interface for executing agent sub-tasks.
+type AgentRuntime interface {
+	ExecuteSubAgent(ctx context.Context, prompt string, maxIterations int) (string, error)
+}
+
+var agentRuntime AgentRuntime
+
+// SetAgentRuntime sets the global agent runtime for sub-agent execution.
+func SetAgentRuntime(rt AgentRuntime) {
+	agentRuntime = rt
+}
 
 // AgentJob represents a running sub-agent.
 type AgentJob struct {
@@ -32,15 +45,16 @@ var (
 func agentTool() *ToolSpec {
 	return &ToolSpec{
 		Name:        "Agent",
+		Permission:  PermDangerFullAccess,
 		Description: "Launch a sub-agent to handle a task autonomously.",
 		InputSchema: map[string]interface{}{
 			"type": "object",
 			"properties": map[string]interface{}{
-				"description":    map[string]interface{}{"type": "string", "description": "Short description of the task"},
-				"prompt":         map[string]interface{}{"type": "string", "description": "The full task prompt"},
-				"subagent_type":  map[string]interface{}{"type": "string", "description": "Agent type: general-purpose, Explore, Plan"},
-				"name":           map[string]interface{}{"type": "string", "description": "Optional agent name"},
-				"model":          map[string]interface{}{"type": "string", "description": "Model override"},
+				"description":   map[string]interface{}{"type": "string", "description": "Short description of the task"},
+				"prompt":        map[string]interface{}{"type": "string", "description": "The full task prompt"},
+				"subagent_type": map[string]interface{}{"type": "string", "description": "Agent type: general-purpose, Explore, Plan"},
+				"name":          map[string]interface{}{"type": "string", "description": "Optional agent name"},
+				"model":         map[string]interface{}{"type": "string", "description": "Model override"},
 			},
 			"required": []string{"description", "prompt"},
 		},
@@ -59,7 +73,7 @@ func agentTool() *ToolSpec {
 				Name:        fmt.Sprintf("Agent %d", agentSeq),
 				Description: description,
 				Type:        agentType,
-				Status:      "pending",
+				Status:      "running",
 				Prompt:      prompt,
 				StartedAt:   time.Now(),
 			}
@@ -72,11 +86,41 @@ func agentTool() *ToolSpec {
 			manifest, _ := json.MarshalIndent(job, "", "  ")
 			os.WriteFile(filepath.Join(agentDir, job.ID+".json"), manifest, 0644)
 
-			// For MVP: return info about the agent task
-			// In a full implementation, this would spawn a goroutine with its own ConversationRuntime
-			output := fmt.Sprintf("Agent task queued: %s\nType: %s\nStatus: pending\n\nNote: Sub-agent execution requires a running conversation loop. The agent prompt has been recorded.", description, agentType)
+			// Execute sub-agent if runtime is available
+			if agentRuntime != nil {
+				ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
+				defer cancel()
 
-			return output, nil
+				maxIter := 10
+				if agentType == "Explore" {
+					maxIter = 5
+				} else if agentType == "Plan" {
+					maxIter = 3
+				}
+
+				output, err := agentRuntime.ExecuteSubAgent(ctx, prompt, maxIter)
+
+				agentMu.Lock()
+				job.Status = "completed"
+				job.Output = output
+				job.CompletedAt = time.Now()
+				if err != nil {
+					job.Status = "failed"
+					job.Output = fmt.Sprintf("error: %v", err)
+				}
+				// Update persisted state
+				manifest, _ = json.MarshalIndent(job, "", "  ")
+				os.WriteFile(filepath.Join(agentDir, job.ID+".json"), manifest, 0644)
+				agentMu.Unlock()
+
+				if err != nil {
+					return fmt.Sprintf("Agent %s failed: %v", job.ID, err), nil
+				}
+				return output, nil
+			}
+
+			// Fallback: queue only
+			return fmt.Sprintf("Agent task queued: %s\nType: %s\nStatus: pending\n\nNote: No agent runtime available. The agent prompt has been recorded.", description, agentType), nil
 		},
 	}
 }
@@ -84,6 +128,7 @@ func agentTool() *ToolSpec {
 func skillTool() *ToolSpec {
 	return &ToolSpec{
 		Name:        "Skill",
+		Permission:  PermReadOnly,
 		Description: "Execute a named skill.",
 		InputSchema: map[string]interface{}{
 			"type": "object",
@@ -100,7 +145,6 @@ func skillTool() *ToolSpec {
 				return "", fmt.Errorf("skill name is required")
 			}
 
-			// Search for skill in .claw/skills/ and ~/.claw/skills/
 			skillPath := discoverSkill(skillName)
 			if skillPath == "" {
 				return fmt.Sprintf("Skill '%s' not found. No skills directory found.", skillName), nil
@@ -122,19 +166,16 @@ func skillTool() *ToolSpec {
 }
 
 func discoverSkill(name string) string {
-	// Search paths: .claw/skills/, ~/.claw/skills/
 	searchDirs := []string{
 		".claw/skills",
 		filepath.Join(os.Getenv("HOME"), ".claw/skills"),
 	}
 
 	for _, dir := range searchDirs {
-		// Check for <name>/SKILL.md
 		skillFile := filepath.Join(dir, name, "SKILL.md")
 		if _, err := os.Stat(skillFile); err == nil {
 			return skillFile
 		}
-		// Check for <name>.md
 		skillFile = filepath.Join(dir, name+".md")
 		if _, err := os.Stat(skillFile); err == nil {
 			return skillFile
@@ -146,6 +187,7 @@ func discoverSkill(name string) string {
 func sendUserMessageTool() *ToolSpec {
 	return &ToolSpec{
 		Name:        "SendUserMessage",
+		Permission:  PermReadOnly,
 		Description: "Send a message or ask a question to the user.",
 		Aliases:     []string{"Brief"},
 		InputSchema: map[string]interface{}{
