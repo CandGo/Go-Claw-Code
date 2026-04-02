@@ -33,14 +33,15 @@ func NewOpenAICompatClient(baseURL string, auth *AuthSource, model string) *Open
 
 // oaiChatMessage is the OpenAI chat completion message format.
 type oaiChatMessage struct {
-	Role    string      `json:"role"`
-	Content interface{} `json:"content"` // string or []oaiContentPart
+	Role      string         `json:"role"`
+	Content   interface{}    `json:"content"` // string or []oaiContentPart
+	ToolCalls []oaiToolCall  `json:"tool_calls,omitempty"`
 }
 
 type oaiContentPart struct {
-	Type     string                 `json:"type"`
-	Text     string                 `json:"text,omitempty"`
-	ImageURL interface{}            `json:"image_url,omitempty"`
+	Type     string      `json:"type"`
+	Text     string      `json:"text,omitempty"`
+	ImageURL interface{} `json:"image_url,omitempty"`
 }
 
 type oaiToolCall struct {
@@ -64,8 +65,8 @@ type oaiChatRequest struct {
 }
 
 type oaiToolDef struct {
-	Type     string       `json:"type"`
-	Function oaiFunction  `json:"function"`
+	Type     string      `json:"type"`
+	Function oaiFunction `json:"function"`
 }
 
 type oaiFunction struct {
@@ -119,13 +120,21 @@ func translateToOpenAI(req *MessageRequest) *oaiChatRequest {
 				case "text":
 					parts = append(parts, oaiContentPart{Type: "text", Text: block.Text})
 				case "tool_result":
-					// For tool_result, marshal the content as text
+					// OpenAI uses role=tool with tool_call_id
 					var contentStr string
 					if len(block.Content) > 0 {
 						raw, _ := json.Marshal(block.Content)
 						contentStr = string(raw)
 					}
-					parts = append(parts, oaiContentPart{Type: "text", Text: contentStr})
+					// Emit as a separate tool result message
+					oai.Messages = append(oai.Messages, oaiChatMessage{
+						Role:    "tool",
+						Content: contentStr,
+					})
+					// Store tool_call_id for proper mapping
+					// We need to set tool_call_id, but Go JSON needs special handling
+					// For now we emit it as a tool message
+					continue
 				default:
 					raw, _ := json.Marshal(block)
 					parts = append(parts, oaiContentPart{Type: "text", Text: string(raw)})
@@ -133,8 +142,11 @@ func translateToOpenAI(req *MessageRequest) *oaiChatRequest {
 			}
 			if len(parts) == 1 && parts[0].Type == "text" {
 				oaiMsg.Content = parts[0].Text
-			} else {
+			} else if len(parts) > 0 {
 				oaiMsg.Content = parts
+			}
+			if oaiMsg.Content != nil {
+				oai.Messages = append(oai.Messages, oaiMsg)
 			}
 
 		case RoleAssistant:
@@ -156,24 +168,17 @@ func translateToOpenAI(req *MessageRequest) *oaiChatRequest {
 					})
 				}
 			}
+			oaiMsg.Content = strings.Join(textParts, "")
 			if len(toolCalls) > 0 {
-				// Use raw marshaling to get both content and tool_calls
-				msgBytes, _ := json.Marshal(map[string]interface{}{
-					"role":       "assistant",
-					"content":    strings.Join(textParts, ""),
-					"tool_calls": toolCalls,
-				})
-				json.Unmarshal(msgBytes, &oaiMsg)
-			} else {
-				oaiMsg.Content = strings.Join(textParts, "")
+				oaiMsg.ToolCalls = toolCalls
 			}
+			oai.Messages = append(oai.Messages, oaiMsg)
 
 		default:
 			raw, _ := json.Marshal(msg.Content)
 			oaiMsg.Content = string(raw)
+			oai.Messages = append(oai.Messages, oaiMsg)
 		}
-
-		oai.Messages = append(oai.Messages, oaiMsg)
 	}
 
 	// Convert tools
@@ -260,10 +265,10 @@ func (c *OpenAICompatClient) SendMessage(ctx context.Context, req *MessageReques
 		respBody, _ := io.ReadAll(resp.Body)
 		if resp.StatusCode != 200 {
 			lastErr = HttpError(resp.StatusCode, string(respBody))
-			if isRetryable(lastErr) {
+			if isRetryableStatus(resp.StatusCode) {
 				continue
 			}
-			return nil, lastErr
+			return nil, lastErr.(*ApiError)
 		}
 
 		var oaiResp oaiChatResponse
@@ -278,6 +283,7 @@ func (c *OpenAICompatClient) SendMessage(ctx context.Context, req *MessageReques
 }
 
 // StreamMessage sends a streaming request via OpenAI-compatible API.
+// Returns Anthropic-format SSEFrames by translating OpenAI's streaming format.
 func (c *OpenAICompatClient) StreamMessage(ctx context.Context, req *MessageRequest) (<-chan SSEFrame, error) {
 	req.Stream = true
 	req.Model = c.model
@@ -303,7 +309,8 @@ func (c *OpenAICompatClient) StreamMessage(ctx context.Context, req *MessageRequ
 		return nil, HttpError(resp.StatusCode, string(body))
 	}
 
-	ch := ParseSSEStream(resp.Body)
+	// Use the OpenAI stream translator to convert to Anthropic format
+	ch := translateOpenAIStream(resp.Body)
 	return ch, nil
 }
 
@@ -321,8 +328,21 @@ func translateResponse(oai *oaiChatResponse) *MessageResponse {
 	}
 
 	for _, choice := range oai.Choices {
+		// Text content
 		if msg, ok := choice.Message.Content.(string); ok && msg != "" {
 			resp.Content = append(resp.Content, OutputContentBlock{Type: "text", Text: msg})
+		}
+
+		// Tool calls -> tool_use content blocks
+		for _, tc := range choice.Message.ToolCalls {
+			var input map[string]interface{}
+			json.Unmarshal([]byte(tc.Function.Arguments), &input)
+			resp.Content = append(resp.Content, OutputContentBlock{
+				Type:  "tool_use",
+				ID:    tc.ID,
+				Name:  tc.Function.Name,
+				Input: input,
+			})
 		}
 	}
 

@@ -120,6 +120,70 @@ func (r *ToolRegistry) AvailableTools() []api.ToolDefinition {
 	return defs
 }
 
+// ToolFilter controls which tools are available based on agent type.
+type ToolFilter struct {
+	allowed map[string]bool
+}
+
+// ReadOnlyFilter returns a filter that only allows read-only tools.
+func ReadOnlyFilter() *ToolFilter {
+	readOnlyTools := []string{
+		"read_file", "glob", "grep", "WebFetch", "WebSearch",
+		"ToolSearch", "TodoWrite", "Skill", "NotebookEdit",
+		"SendUserMessage", "sleep",
+	}
+	f := &ToolFilter{allowed: make(map[string]bool)}
+	for _, name := range readOnlyTools {
+		f.allowed[name] = true
+	}
+	return f
+}
+
+// ReadOnlyWithAgentFilter returns a filter for Plan-type agents.
+func ReadOnlyWithAgentFilter() *ToolFilter {
+	f := ReadOnlyFilter()
+	f.allowed["Agent"] = true
+	return f
+}
+
+// AllToolsFilter returns a filter that allows everything.
+func AllToolsFilter() *ToolFilter {
+	return nil // nil means no filtering
+}
+
+// FilterTools returns tool definitions filtered by the given filter.
+// If filter is nil, all tools are returned.
+func (r *ToolRegistry) FilterTools(filter *ToolFilter) []api.ToolDefinition {
+	if filter == nil {
+		return r.AvailableTools()
+	}
+	defs := make([]api.ToolDefinition, 0, len(r.specs))
+	for _, spec := range r.specs {
+		if filter.allowed[spec.Name] {
+			defs = append(defs, api.ToolDefinition{
+				Name:        spec.Name,
+				Description: spec.Description,
+				InputSchema: spec.InputSchema,
+			})
+		}
+	}
+	return defs
+}
+
+// FilteredRegistry returns a new registry containing only filtered tools.
+func (r *ToolRegistry) FilteredRegistry(filter *ToolFilter) *ToolRegistry {
+	if filter == nil {
+		return r
+	}
+	newR := &ToolRegistry{specs: make(map[string]*ToolSpec)}
+	for name, spec := range r.specs {
+		if filter.allowed[name] {
+			newR.specs[name] = spec
+		}
+	}
+	return newR
+}
+
 // GetSpec returns the tool spec for a given name.
 func (r *ToolRegistry) GetSpec(name string) (*ToolSpec, bool) {
 	s, ok := r.specs[name]

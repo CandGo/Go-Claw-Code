@@ -92,6 +92,8 @@ func (rt *ConversationRuntime) RunTurn(ctx context.Context, prompt string) ([]Tu
 
 		totalUsage.InputTokens += usage.InputTokens
 		totalUsage.OutputTokens += usage.OutputTokens
+	totalUsage.CacheCreationInputTokens += usage.CacheCreationInputTokens
+	totalUsage.CacheReadInputTokens += usage.CacheReadInputTokens
 
 		// Convert events to output
 		var textParts []string
@@ -245,6 +247,60 @@ func (rt *ConversationRuntime) buildRequest() *api.MessageRequest {
 	}
 }
 
+// filterToolsForAgent returns a filtered ToolExecutor based on agent type.
+// Explore agents get read-only tools, Plan agents get read-only + Agent,
+// all others get full access.
+func filterToolsForAgent(tools ToolExecutor, agentType string) ToolExecutor {
+	type filterable interface {
+		FilteredRegistry(filter interface{}) ToolExecutor
+	}
+
+	readOnlyTools := map[string]bool{
+		"read_file": true, "glob": true, "grep": true,
+		"WebFetch": true, "WebSearch": true,
+		"ToolSearch": true, "Skill": true,
+		"NotebookEdit": true, "SendUserMessage": true,
+		"sleep": true, "TodoWrite": true,
+	}
+
+	// Add Agent for Plan type
+	if agentType == "Plan" || agentType == "general-purpose" {
+		readOnlyTools["Agent"] = true
+	}
+
+	switch agentType {
+	case "Explore":
+		// Read-only subset only
+	case "Plan", "general-purpose":
+		// Read-only + Agent
+	default:
+		return nil // no filtering
+	}
+
+	return &filteredToolExecutor{inner: tools, allowed: readOnlyTools}
+}
+
+// filteredToolExecutor wraps a ToolExecutor and filters available tools.
+type filteredToolExecutor struct {
+	inner   ToolExecutor
+	allowed map[string]bool
+}
+
+func (f *filteredToolExecutor) Execute(toolName string, input map[string]interface{}) (string, error) {
+	return f.inner.Execute(toolName, input)
+}
+
+func (f *filteredToolExecutor) AvailableTools() []api.ToolDefinition {
+	all := f.inner.AvailableTools()
+	var filtered []api.ToolDefinition
+	for _, t := range all {
+		if f.allowed[t.Name] {
+			filtered = append(filtered, t)
+		}
+	}
+	return filtered
+}
+
 func joinStrings(parts []string) string {
 	result := ""
 	for i, p := range parts {
@@ -259,10 +315,18 @@ func joinStrings(parts []string) string {
 // ExecuteSubAgent runs a sub-agent with its own isolated session.
 // It creates a new conversation runtime with the same provider and tools
 // but a fresh session, and runs the given prompt for up to maxIterations.
-func (rt *ConversationRuntime) ExecuteSubAgent(ctx context.Context, prompt string, maxIterations int) (string, error) {
+// agentType controls tool filtering: "Explore" gets read-only tools,
+// "Plan" gets read-only + Agent tools, others get all tools.
+func (rt *ConversationRuntime) ExecuteSubAgent(ctx context.Context, prompt string, maxIterations int, agentType string) (string, error) {
+	// Apply tool filtering based on agent type
+	toolExec := rt.tools
+	if filtered := filterToolsForAgent(rt.tools, agentType); filtered != nil {
+		toolExec = filtered
+	}
+
 	subRt := &ConversationRuntime{
 		provider:     rt.provider,
-		tools:        rt.tools,
+		tools:        toolExec,
 		session:      NewSession(),
 		policy:       rt.policy,
 		hooks:        rt.hooks,

@@ -11,6 +11,7 @@ type ProviderKind int
 const (
 	ProviderAnthropic ProviderKind = iota
 	ProviderOpenAI
+	ProviderXAI
 )
 
 // Provider is the interface for LLM API backends.
@@ -21,36 +22,41 @@ type Provider interface {
 	StreamMessage(ctx context.Context, req *MessageRequest) (<-chan SSEFrame, error)
 }
 
-// ResolveModelAlias maps short aliases to full model names.
+// ResolveModelAlias maps short aliases to full model names using the model registry.
 func ResolveModelAlias(model string) string {
-	aliases := map[string]string{
-		"opus":   "claude-opus-4-6",
-		"sonnet": "claude-sonnet-4-6",
-		"haiku":  "claude-haiku-4-5-20251001",
-	}
-	if full, ok := aliases[strings.ToLower(model)]; ok {
-		return full
+	if entry := lookupModel(model); entry != nil {
+		return entry.ID
 	}
 	return model
 }
 
 // DetectProviderKind returns the provider kind based on the model name.
 func DetectProviderKind(model string) ProviderKind {
-	m := strings.ToLower(model)
-	if strings.Contains(m, "gpt") || strings.Contains(m, "o1") || strings.Contains(m, "o3") ||
-		strings.Contains(m, "deepseek") || strings.Contains(m, "qwen") || strings.Contains(m, "glm") {
-		return ProviderOpenAI
+	// Check registry first
+	if entry := lookupModel(model); entry != nil {
+		return providerFromString(entry.Provider)
 	}
-	return ProviderAnthropic
+
+	// Fallback heuristics for unknown models
+	m := strings.ToLower(model)
+	switch {
+	case strings.Contains(m, "gpt"), strings.Contains(m, "o1-"), strings.Contains(m, "o3-"):
+		return ProviderOpenAI
+	case strings.Contains(m, "grok"):
+		return ProviderXAI
+	case strings.Contains(m, "deepseek"), strings.Contains(m, "qwen"), strings.Contains(m, "glm"):
+		return ProviderOpenAI // OpenAI-compatible
+	default:
+		return ProviderAnthropic
+	}
 }
 
 // MaxTokensForModel returns the default max output tokens for a model.
 func MaxTokensForModel(model string) int {
-	m := strings.ToLower(model)
-	if strings.Contains(m, "opus") {
-		return 32000
+	if entry := lookupModel(model); entry != nil {
+		return entry.MaxTokens
 	}
-	return 64000
+	return 4096 // safe default
 }
 
 // NewProvider creates the appropriate provider based on model name and config.
@@ -63,7 +69,7 @@ func NewProvider(model string, auth *AuthSource, baseURL string) Provider {
 
 	kind := DetectProviderKind(model)
 	switch kind {
-	case ProviderOpenAI:
+	case ProviderOpenAI, ProviderXAI:
 		return NewOpenAICompatClient(baseURL, auth, model)
 	default:
 		return NewAnthropicClient(baseURL, auth, model)

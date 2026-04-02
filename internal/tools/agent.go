@@ -13,7 +13,7 @@ import (
 
 // AgentRuntime is a minimal interface for executing agent sub-tasks.
 type AgentRuntime interface {
-	ExecuteSubAgent(ctx context.Context, prompt string, maxIterations int) (string, error)
+	ExecuteSubAgent(ctx context.Context, prompt string, maxIterations int, agentType string) (string, error)
 }
 
 var agentRuntime AgentRuntime
@@ -98,7 +98,7 @@ func agentTool() *ToolSpec {
 					maxIter = 3
 				}
 
-				output, err := agentRuntime.ExecuteSubAgent(ctx, prompt, maxIter)
+				output, err := agentRuntime.ExecuteSubAgent(ctx, prompt, maxIter, agentType)
 
 				agentMu.Lock()
 				job.Status = "completed"

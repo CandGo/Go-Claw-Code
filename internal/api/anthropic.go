@@ -169,6 +169,12 @@ func CollectStreamEvents(frames <-chan SSEFrame) ([]AssistantEvent, Usage, error
 				if u, ok := msgRaw["usage"].(map[string]interface{}); ok {
 					usage.InputTokens = int(u["input_tokens"].(float64))
 					usage.OutputTokens = int(u["output_tokens"].(float64))
+					if v, ok := u["cache_creation_input_tokens"].(float64); ok {
+						usage.CacheCreationInputTokens = int(v)
+					}
+					if v, ok := u["cache_read_input_tokens"].(float64); ok {
+						usage.CacheReadInputTokens = int(v)
+					}
 				}
 			}
 

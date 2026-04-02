@@ -116,6 +116,14 @@ type OutputContentBlock struct {
 type Usage struct {
 	InputTokens  int `json:"input_tokens"`
 	OutputTokens int `json:"output_tokens"`
+	// Cache token tracking for cost estimation
+	CacheCreationInputTokens int `json:"cache_creation_input_tokens,omitempty"`
+	CacheReadInputTokens     int `json:"cache_read_input_tokens,omitempty"`
+}
+
+// TotalInputTokens returns the effective total input tokens including cache reads.
+func (u Usage) TotalInputTokens() int {
+	return u.InputTokens + u.CacheCreationInputTokens + u.CacheReadInputTokens
 }
 
 // StreamEvent represents a single SSE event from the streaming API.
