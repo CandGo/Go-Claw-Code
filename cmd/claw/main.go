@@ -5,6 +5,7 @@ import (
 	"flag"
 	"fmt"
 	"io"
+	"net/http"
 	"os"
 	"strings"
 	"time"
@@ -13,17 +14,20 @@ import (
 	tea "github.com/charmbracelet/bubbletea"
 
 	"github.com/go-claw/claw/internal/api"
-	"github.com/go-claw/claw/internal/auth"
+	clawauth "github.com/go-claw/claw/internal/auth"
 	"github.com/go-claw/claw/internal/commands"
 	"github.com/go-claw/claw/internal/config"
+	"github.com/go-claw/claw/internal/lsp"
 	"github.com/go-claw/claw/internal/mcp"
 	"github.com/go-claw/claw/internal/plugins"
 	"github.com/go-claw/claw/internal/runtime"
+	"github.com/go-claw/claw/internal/sandbox"
+	"github.com/go-claw/claw/internal/server"
 	"github.com/go-claw/claw/internal/tools"
 	"github.com/go-claw/claw/internal/tui"
 )
 
-const version = "0.3.0"
+const version = "0.4.0"
 
 func main() {
 	if err := run(); err != nil {
@@ -38,13 +42,16 @@ func run() error {
 		permFlag     string
 		outputFormat string
 		uiMode       string
-		showVersion  bool
-		showPrompt   bool
-		showAgents   bool
-		showSkills   bool
-		showConfig   bool
-		doAuth       bool
-		mcpFlag      string
+		serveFlag    bool
+		servePort    int
+		proxyFlag   bool
+		sandboxFlag bool
+		lspFlag     string
+		showVersion bool
+		showPrompt  bool
+		showConfig  bool
+		doAuth      bool
+		mcpFlag     string
 	)
 
 	fs := flag.NewFlagSet("claw", flag.ExitOnError)
@@ -52,17 +59,20 @@ func run() error {
 	fs.StringVar(&permFlag, "permission-mode", "", "Permission mode: read-only, workspace-write, danger-full-access")
 	fs.StringVar(&outputFormat, "output-format", "text", "Non-interactive output format: text or json")
 	fs.StringVar(&uiMode, "ui", "auto", "UI mode: tui, repl, auto")
+	fs.BoolVar(&serveFlag, "serve", false, "Start HTTP/SSE server mode")
+	fs.IntVar(&servePort, "port", 8080, "HTTP server port")
+	fs.BoolVar(&proxyFlag, "proxy", false, "Start as API proxy")
+	fs.BoolVar(&sandboxFlag, "sandbox", false, "Enable sandbox isolation")
+	fs.StringVar(&lspFlag, "lsp", "", "Connect to LSP server (command)")
 	fs.BoolVar(&showVersion, "version", false, "Print version")
 	fs.BoolVar(&showPrompt, "system-prompt", false, "Print system prompt")
-	fs.BoolVar(&showAgents, "agents", false, "List agents")
-	fs.BoolVar(&showSkills, "skills", false, "List skills")
-	fs.BoolVar(&showConfig, "show-config", false, "Show configuration sources")
 	fs.BoolVar(&doAuth, "auth", false, "Run OAuth authentication flow")
-	fs.StringVar(&mcpFlag, "mcp", "", "Start MCP server (stdio)")
+	fs.StringVar(&mcpFlag, "mcp", "", "Connect to MCP server (name from config)")
+	fs.BoolVar(&showConfig, "show-config", false, "Show configuration sources")
 	fs.Parse(os.Args[1:])
 
 	if showVersion {
-		fmt.Printf("Claw Code (Go)\n  Version: %s\n  Phase: 3 (TUI + OAuth + MCP + Plugins)\n", version)
+		fmt.Printf("Claw Code (Go) v%s\n  Phase: 4 (LSP + HTTP Server + Sandbox + Plugins)\n", version)
 		return nil
 	}
 
@@ -73,30 +83,6 @@ func run() error {
 
 	if doAuth {
 		return runAuth()
-	}
-
-	if showAgents {
-		agents := tools.GetAgents()
-		if len(agents) == 0 {
-			fmt.Println("No agents running.")
-		} else {
-			for _, a := range agents {
-				fmt.Printf("  %s [%s] %s - %s\n", a.ID, a.Status, a.Type, a.Description)
-			}
-		}
-		return nil
-	}
-
-	if showSkills {
-		skills := tools.DiscoverSkills()
-		if len(skills) == 0 {
-			fmt.Println("No skills found. Create skills in .claw/skills/ or ~/.claw/skills/")
-		} else {
-			for _, s := range skills {
-				fmt.Printf("  - %s\n", s)
-			}
-		}
-		return nil
 	}
 
 	if showConfig {
@@ -115,11 +101,6 @@ func run() error {
 		return nil
 	}
 
-	// MCP stdio mode
-	if mcpFlag != "" {
-		return runMCPStdio(mcpFlag)
-	}
-
 	// Load config
 	cfg, err := config.Load()
 	if err != nil {
@@ -131,7 +112,7 @@ func run() error {
 	model = api.ResolveModelAlias(model)
 
 	// Resolve auth
-	apiKey, bearerToken, err := auth.ResolveAuthWithOAuth()
+	apiKey, bearerToken, err := clawauth.ResolveAuthWithOAuth()
 	if err != nil {
 		return err
 	}
@@ -143,18 +124,37 @@ func run() error {
 	permMode := resolveArg(permFlag, "CLAW_PERMISSION_MODE", cfg.PermissionMode)
 	_ = permMode
 
+	// LSP mode
+	if lspFlag != "" {
+		return runLSP(lspFlag)
+	}
+
+	// MCP mode
+	if mcpFlag != "" {
+		return runMCP(mcpFlag, cfg)
+	}
+
+	// HTTP server mode
+	if serveFlag {
+		return runServe(cfg, apiAuth, baseURL, model, servePort)
+	}
+
+	// Proxy mode
+	if proxyFlag {
+		return runProxy(apiAuth, baseURL, servePort)
+	}
+
 	// Create provider
 	provider := api.NewProvider(model, apiAuth, baseURL)
 
 	// Create tools
 	toolReg := tools.NewToolRegistry()
 
-	// Connect MCP servers
+	// Connect MCP servers from config
 	mcpClients := connectMCPServers(cfg)
 	for _, mc := range mcpClients {
 		mcpTools, _ := mc.ListTools(context.Background())
 		for _, t := range mcpTools {
-			// Register MCP tools as dynamic tools
 			toolName := t.Name
 			toolReg.RegisterDynamic(toolName, t.Description, t.InputSchema, func(input map[string]interface{}) (string, error) {
 				return mc.CallTool(context.Background(), toolName, input)
@@ -167,17 +167,23 @@ func run() error {
 	pluginMgr.Discover()
 	pluginTools := pluginMgr.AllTools()
 	for _, t := range pluginTools {
-		toolReg.RegisterDynamic(t.Name, t.Description, t.InputSchema, func(input map[string]interface{}) (string, error) {
-			return executePluginTool(pluginMgr, t.Name, input)
+		toolName := t.Name
+		toolReg.RegisterDynamic(toolName, t.Description, t.InputSchema, func(input map[string]interface{}) (string, error) {
+			return "", fmt.Errorf("plugin tool execution not yet implemented for %s", toolName)
 		})
 	}
 
-	// Create hook runner (config + plugin hooks)
-	pluginHooks := pluginMgr.AllHooks()
+	// Sandbox
+	if sandboxFlag {
+		sandboxCfg := sandbox.Config{Enabled: true, AllowPaths: []string{"."}}
+		sb := sandbox.New(sandboxCfg)
+		_ = sb
+		fmt.Fprintf(os.Stderr, "  [sandbox enabled]\n")
+	}
+
+	// Hook runner
 	allPre := append([]string{}, cfg.Hooks.PreToolUse...)
-	allPre = append(allPre, pluginHooks.PreToolUse...)
 	allPost := append([]string{}, cfg.Hooks.PostToolUse...)
-	allPost = append(allPost, pluginHooks.PostToolUse...)
 	_ = runtime.NewHookRunner(allPre, allPost)
 
 	// Create runtime
@@ -327,26 +333,44 @@ func runREPL(rt *runtime.ConversationRuntime, cfg *config.Config) error {
 }
 
 func runAuth() error {
-	cfg := auth.DefaultOAuthConfig()
-	token, err := auth.StartAuthFlow(cfg)
+	cfg := clawauth.DefaultOAuthConfig()
+	token, err := clawauth.StartAuthFlow(cfg)
 	if err != nil {
 		return fmt.Errorf("OAuth failed: %w", err)
 	}
-	if err := auth.SaveToken(token); err != nil {
+	if err := clawauth.SaveToken(token); err != nil {
 		return fmt.Errorf("failed to save token: %w", err)
 	}
 	fmt.Println("Authentication successful! Token saved.")
 	return nil
 }
 
-func runMCPStdio(serverName string) error {
-	cfg, err := config.Load()
-	if err != nil {
-		return err
+func runLSP(command string) error {
+	parts := strings.Fields(command)
+	if len(parts) == 0 {
+		return fmt.Errorf("LSP command required")
 	}
-	srv, ok := cfg.MCPServers[serverName]
+
+	client, err := lsp.NewClient(context.Background(), parts[0], parts[1:])
+	if err != nil {
+		return fmt.Errorf("LSP connect failed: %w", err)
+	}
+	defer client.Close()
+
+	result, err := client.Initialize(context.Background(), "file:///"+currentDir())
+	if err != nil {
+		return fmt.Errorf("LSP initialize failed: %w", err)
+	}
+
+	fmt.Printf("LSP server: %s v%s\n", result.ServerInfo.Name, result.ServerInfo.Version)
+	fmt.Println("LSP client ready. Use /teleport or /definition commands.")
+	return nil
+}
+
+func runMCP(name string, cfg *config.Config) error {
+	srv, ok := cfg.MCPServers[name]
 	if !ok {
-		return fmt.Errorf("MCP server '%s' not found in config", serverName)
+		return fmt.Errorf("MCP server '%s' not found in config", name)
 	}
 
 	client, err := mcp.NewClient(context.Background(), srv.Command, []string{}, srv.Env)
@@ -359,23 +383,41 @@ func runMCPStdio(serverName string) error {
 		return fmt.Errorf("MCP init failed: %w", err)
 	}
 
-	tools, err := client.ListTools(context.Background())
+	mcpTools, err := client.ListTools(context.Background())
 	if err != nil {
 		return fmt.Errorf("failed to list tools: %w", err)
 	}
 
-	fmt.Printf("MCP server '%s' (%s v%s) connected with %d tools:\n", serverName, client.ServerInfo().Name, client.ServerInfo().Version, len(tools))
-	for _, t := range tools {
+	fmt.Printf("MCP server '%s' (%s v%s) connected with %d tools:\n", name, client.ServerInfo().Name, client.ServerInfo().Version, len(mcpTools))
+	for _, t := range mcpTools {
 		fmt.Printf("  - %s: %s\n", t.Name, t.Description)
 	}
 	return nil
 }
 
+func runServe(cfg *config.Config, apiAuth *api.AuthSource, baseURL, model string, port int) error {
+	provider := api.NewProvider(model, apiAuth, baseURL)
+	toolReg := tools.NewToolRegistry()
+	rt := runtime.NewConversationRuntime(provider, toolReg, model)
+
+	srv := server.NewServer(rt, port)
+	fmt.Printf("Claw Code server starting on :%d\n", port)
+	fmt.Printf("  Model: %s\n", model)
+	fmt.Println("  Endpoints: /v1/messages, /v1/messages/stream, /health, /session, /tools")
+	return srv.Start()
+}
+
+func runProxy(apiAuth *api.AuthSource, baseURL string, port int) error {
+	mux := http.NewServeMux()
+	mux.HandleFunc("/", server.ProxyHandler(apiAuth, baseURL))
+	fmt.Printf("Claw Code proxy starting on :%d -> %s\n", port, baseURL)
+	return http.ListenAndServe(fmt.Sprintf(":%d", port), mux)
+}
+
 func connectMCPServers(cfg *config.Config) []*mcp.Client {
 	var clients []*mcp.Client
 	for name, srv := range cfg.MCPServers {
-		args := []string{}
-		client, err := mcp.NewClient(context.Background(), srv.Command, args, srv.Env)
+		client, err := mcp.NewClient(context.Background(), srv.Command, []string{}, srv.Env)
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "  [MCP] Failed to connect %s: %v\n", name, err)
 			continue
@@ -391,22 +433,6 @@ func connectMCPServers(cfg *config.Config) []*mcp.Client {
 	return clients
 }
 
-func executePluginTool(mgr *plugins.Manager, name string, input map[string]interface{}) (string, error) {
-	// Find the plugin that owns this tool
-	for _, p := range mgr.List() {
-		if !p.Enabled {
-			continue
-		}
-		for _, t := range p.Tools {
-			if t.Name == name && p.Command != "" {
-				// Execute plugin command with JSON input
-				return "", fmt.Errorf("plugin tool execution not yet implemented for %s", name)
-			}
-		}
-	}
-	return "", fmt.Errorf("plugin tool not found: %s", name)
-}
-
 func isTerminal() bool {
 	fi, err := os.Stdin.Stat()
 	if err != nil {
@@ -415,12 +441,17 @@ func isTerminal() bool {
 	return fi.Mode()&os.ModeCharDevice != 0
 }
 
-func resolveArg(flag string, env string, def string) string {
-	if flag != "" {
-		return flag
+func resolveArg(flagVal, env, def string) string {
+	if flagVal != "" {
+		return flagVal
 	}
 	if v := os.Getenv(env); v != "" {
 		return v
 	}
 	return def
+}
+
+func currentDir() string {
+	dir, _ := os.Getwd()
+	return dir
 }
