@@ -27,7 +27,7 @@ import (
 	"github.com/go-claw/claw/internal/tui"
 )
 
-const version = "0.4.0"
+const version = "0.4.0" // kept for local use; commands.Version is authoritative
 
 func main() {
 	if err := run(); err != nil {
