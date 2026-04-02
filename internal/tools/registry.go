@@ -69,6 +69,16 @@ func (r *ToolRegistry) register(spec *ToolSpec) {
 	r.specs[spec.Name] = spec
 }
 
+// RegisterDynamic registers a dynamically-created tool (e.g., from MCP or plugins).
+func (r *ToolRegistry) RegisterDynamic(name, description string, inputSchema map[string]interface{}, handler func(input map[string]interface{}) (string, error)) {
+	r.specs[name] = &ToolSpec{
+		Name:        name,
+		Description: description,
+		InputSchema: inputSchema,
+		Handler:     handler,
+	}
+}
+
 // Execute runs a tool by name.
 func (r *ToolRegistry) Execute(toolName string, input map[string]interface{}) (string, error) {
 	spec, ok := r.specs[toolName]

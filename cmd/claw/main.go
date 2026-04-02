@@ -10,15 +10,20 @@ import (
 	"time"
 
 	"github.com/ergochat/readline"
+	tea "github.com/charmbracelet/bubbletea"
 
 	"github.com/go-claw/claw/internal/api"
+	"github.com/go-claw/claw/internal/auth"
 	"github.com/go-claw/claw/internal/commands"
 	"github.com/go-claw/claw/internal/config"
+	"github.com/go-claw/claw/internal/mcp"
+	"github.com/go-claw/claw/internal/plugins"
 	"github.com/go-claw/claw/internal/runtime"
 	"github.com/go-claw/claw/internal/tools"
+	"github.com/go-claw/claw/internal/tui"
 )
 
-const version = "0.2.0"
+const version = "0.3.0"
 
 func main() {
 	if err := run(); err != nil {
@@ -32,32 +37,42 @@ func run() error {
 		modelFlag    string
 		permFlag     string
 		outputFormat string
+		uiMode       string
 		showVersion  bool
 		showPrompt   bool
 		showAgents   bool
 		showSkills   bool
 		showConfig   bool
+		doAuth       bool
+		mcpFlag      string
 	)
 
 	fs := flag.NewFlagSet("claw", flag.ExitOnError)
 	fs.StringVar(&modelFlag, "model", "", "Override the active model")
 	fs.StringVar(&permFlag, "permission-mode", "", "Permission mode: read-only, workspace-write, danger-full-access")
 	fs.StringVar(&outputFormat, "output-format", "text", "Non-interactive output format: text or json")
+	fs.StringVar(&uiMode, "ui", "auto", "UI mode: tui, repl, auto")
 	fs.BoolVar(&showVersion, "version", false, "Print version")
 	fs.BoolVar(&showPrompt, "system-prompt", false, "Print system prompt")
 	fs.BoolVar(&showAgents, "agents", false, "List agents")
 	fs.BoolVar(&showSkills, "skills", false, "List skills")
 	fs.BoolVar(&showConfig, "show-config", false, "Show configuration sources")
+	fs.BoolVar(&doAuth, "auth", false, "Run OAuth authentication flow")
+	fs.StringVar(&mcpFlag, "mcp", "", "Start MCP server (stdio)")
 	fs.Parse(os.Args[1:])
 
 	if showVersion {
-		fmt.Printf("Claw Code (Go)\n  Version: %s\n  Go: %s\n  OS: %s/%s\n", version, "1.23", os.Getenv("GOOS"), os.Getenv("GOARCH"))
+		fmt.Printf("Claw Code (Go)\n  Version: %s\n  Phase: 3 (TUI + OAuth + MCP + Plugins)\n", version)
 		return nil
 	}
 
 	if showPrompt {
 		fmt.Print(runtime.DefaultSystemPrompt())
 		return nil
+	}
+
+	if doAuth {
+		return runAuth()
 	}
 
 	if showAgents {
@@ -100,6 +115,11 @@ func run() error {
 		return nil
 	}
 
+	// MCP stdio mode
+	if mcpFlag != "" {
+		return runMCPStdio(mcpFlag)
+	}
+
 	// Load config
 	cfg, err := config.Load()
 	if err != nil {
@@ -111,26 +131,54 @@ func run() error {
 	model = api.ResolveModelAlias(model)
 
 	// Resolve auth
-	auth, err := api.ResolveAuth()
+	apiKey, bearerToken, err := auth.ResolveAuthWithOAuth()
 	if err != nil {
 		return err
 	}
+	apiAuth := &api.AuthSource{APIKey: apiKey, BearerToken: bearerToken}
 
 	baseURL := api.BaseURL()
 
 	// Permission mode
 	permMode := resolveArg(permFlag, "CLAW_PERMISSION_MODE", cfg.PermissionMode)
-	_ = permMode // used by runtime policy
+	_ = permMode
 
 	// Create provider
-	provider := api.NewProvider(model, auth, baseURL)
+	provider := api.NewProvider(model, apiAuth, baseURL)
 
 	// Create tools
 	toolReg := tools.NewToolRegistry()
 
-	// Create hook runner from config
-	hookRunner := runtime.NewHookRunner(cfg.Hooks.PreToolUse, cfg.Hooks.PostToolUse)
-	_ = hookRunner // will be integrated into runtime
+	// Connect MCP servers
+	mcpClients := connectMCPServers(cfg)
+	for _, mc := range mcpClients {
+		mcpTools, _ := mc.ListTools(context.Background())
+		for _, t := range mcpTools {
+			// Register MCP tools as dynamic tools
+			toolName := t.Name
+			toolReg.RegisterDynamic(toolName, t.Description, t.InputSchema, func(input map[string]interface{}) (string, error) {
+				return mc.CallTool(context.Background(), toolName, input)
+			})
+		}
+	}
+
+	// Discover plugins
+	pluginMgr := plugins.NewManager()
+	pluginMgr.Discover()
+	pluginTools := pluginMgr.AllTools()
+	for _, t := range pluginTools {
+		toolReg.RegisterDynamic(t.Name, t.Description, t.InputSchema, func(input map[string]interface{}) (string, error) {
+			return executePluginTool(pluginMgr, t.Name, input)
+		})
+	}
+
+	// Create hook runner (config + plugin hooks)
+	pluginHooks := pluginMgr.AllHooks()
+	allPre := append([]string{}, cfg.Hooks.PreToolUse...)
+	allPre = append(allPre, pluginHooks.PreToolUse...)
+	allPost := append([]string{}, cfg.Hooks.PostToolUse...)
+	allPost = append(allPost, pluginHooks.PostToolUse...)
+	_ = runtime.NewHookRunner(allPre, allPost)
 
 	// Create runtime
 	rt := runtime.NewConversationRuntime(provider, toolReg, model)
@@ -142,7 +190,12 @@ func run() error {
 		return runOnce(rt, prompt, outputFormat)
 	}
 
-	// Interactive REPL
+	// Choose UI mode
+	useTUI := uiMode == "tui" || (uiMode == "auto" && isTerminal())
+
+	if useTUI {
+		return runTUI(rt, cfg)
+	}
 	return runREPL(rt, cfg)
 }
 
@@ -170,6 +223,13 @@ func runOnce(rt *runtime.ConversationRuntime, prompt string, format string) erro
 		fmt.Fprintf(os.Stderr, "\n  tokens: in=%d out=%d\n", usage.InputTokens, usage.OutputTokens)
 	}
 	return nil
+}
+
+func runTUI(rt *runtime.ConversationRuntime, cfg *config.Config) error {
+	model := tui.NewModel(rt)
+	p := tea.NewProgram(model, tea.WithAltScreen())
+	_, err := p.Run()
+	return err
 }
 
 func runREPL(rt *runtime.ConversationRuntime, cfg *config.Config) error {
@@ -217,7 +277,6 @@ func runREPL(rt *runtime.ConversationRuntime, cfg *config.Config) error {
 			} else if output != "" {
 				fmt.Println(output)
 			}
-			// Handle compact command specially
 			if cmd.Name == "compact" {
 				if rt.MessageCount() > compactionCfg.PreserveRecent {
 					rt.Compact(compactionCfg)
@@ -229,13 +288,13 @@ func runREPL(rt *runtime.ConversationRuntime, cfg *config.Config) error {
 			continue
 		}
 
-		// Check if compaction is needed
+		// Check compaction
 		if rt.ShouldCompact(compactionCfg) {
 			rt.Compact(compactionCfg)
 			fmt.Fprintf(os.Stderr, "  [auto-compacted, messages: %d]\n", rt.MessageCount())
 		}
 
-		// Run conversation turn
+		// Run turn
 		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
 		outputs, usage, err := rt.RunTurn(ctx, line)
 		cancel()
@@ -265,6 +324,95 @@ func runREPL(rt *runtime.ConversationRuntime, cfg *config.Config) error {
 	}
 
 	return nil
+}
+
+func runAuth() error {
+	cfg := auth.DefaultOAuthConfig()
+	token, err := auth.StartAuthFlow(cfg)
+	if err != nil {
+		return fmt.Errorf("OAuth failed: %w", err)
+	}
+	if err := auth.SaveToken(token); err != nil {
+		return fmt.Errorf("failed to save token: %w", err)
+	}
+	fmt.Println("Authentication successful! Token saved.")
+	return nil
+}
+
+func runMCPStdio(serverName string) error {
+	cfg, err := config.Load()
+	if err != nil {
+		return err
+	}
+	srv, ok := cfg.MCPServers[serverName]
+	if !ok {
+		return fmt.Errorf("MCP server '%s' not found in config", serverName)
+	}
+
+	client, err := mcp.NewClient(context.Background(), srv.Command, []string{}, srv.Env)
+	if err != nil {
+		return fmt.Errorf("failed to start MCP server: %w", err)
+	}
+	defer client.Close()
+
+	if err := client.Initialize(context.Background()); err != nil {
+		return fmt.Errorf("MCP init failed: %w", err)
+	}
+
+	tools, err := client.ListTools(context.Background())
+	if err != nil {
+		return fmt.Errorf("failed to list tools: %w", err)
+	}
+
+	fmt.Printf("MCP server '%s' (%s v%s) connected with %d tools:\n", serverName, client.ServerInfo().Name, client.ServerInfo().Version, len(tools))
+	for _, t := range tools {
+		fmt.Printf("  - %s: %s\n", t.Name, t.Description)
+	}
+	return nil
+}
+
+func connectMCPServers(cfg *config.Config) []*mcp.Client {
+	var clients []*mcp.Client
+	for name, srv := range cfg.MCPServers {
+		args := []string{}
+		client, err := mcp.NewClient(context.Background(), srv.Command, args, srv.Env)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "  [MCP] Failed to connect %s: %v\n", name, err)
+			continue
+		}
+		if err := client.Initialize(context.Background()); err != nil {
+			fmt.Fprintf(os.Stderr, "  [MCP] Init failed for %s: %v\n", name, err)
+			client.Close()
+			continue
+		}
+		fmt.Fprintf(os.Stderr, "  [MCP] Connected: %s (%s)\n", name, client.ServerInfo().Name)
+		clients = append(clients, client)
+	}
+	return clients
+}
+
+func executePluginTool(mgr *plugins.Manager, name string, input map[string]interface{}) (string, error) {
+	// Find the plugin that owns this tool
+	for _, p := range mgr.List() {
+		if !p.Enabled {
+			continue
+		}
+		for _, t := range p.Tools {
+			if t.Name == name && p.Command != "" {
+				// Execute plugin command with JSON input
+				return "", fmt.Errorf("plugin tool execution not yet implemented for %s", name)
+			}
+		}
+	}
+	return "", fmt.Errorf("plugin tool not found: %s", name)
+}
+
+func isTerminal() bool {
+	fi, err := os.Stdin.Stat()
+	if err != nil {
+		return false
+	}
+	return fi.Mode()&os.ModeCharDevice != 0
 }
 
 func resolveArg(flag string, env string, def string) string {
