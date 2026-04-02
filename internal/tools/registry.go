@@ -13,13 +13,23 @@ import (
 	"github.com/go-claw/claw/internal/api"
 )
 
+// PermissionLevel defines the required permission for a tool.
+type PermissionLevel int
+
+const (
+	PermReadOnly PermissionLevel = iota
+	PermWorkspaceWrite
+	PermDangerFullAccess
+)
+
 // ToolSpec describes a single tool.
 type ToolSpec struct {
-	Name        string
-	Description string
-	InputSchema map[string]interface{}
-	Handler     func(input map[string]interface{}) (string, error)
-	Aliases     []string
+	Name         string
+	Description  string
+	InputSchema  map[string]interface{}
+	Handler      func(input map[string]interface{}) (string, error)
+	Aliases      []string
+	Permission   PermissionLevel
 }
 
 // ToolRegistry manages all available tools.
@@ -56,10 +66,18 @@ func NewToolRegistry() *ToolRegistry {
 	// Notebook
 	r.register(notebookEditTool())
 
+
+
 	// Misc
 	r.register(sleepTool())
 	r.register(toolSearchTool())
 	r.register(sendUserMessageTool())
+
+	// System tools
+	r.register(configTool())
+	r.register(structuredOutputTool())
+	r.register(replTool())
+	r.register(powershellTool())
 
 	globalRegistry = r
 	return r
@@ -76,6 +94,7 @@ func (r *ToolRegistry) RegisterDynamic(name, description string, inputSchema map
 		Description: description,
 		InputSchema: inputSchema,
 		Handler:     handler,
+		Permission:  PermReadOnly,
 	}
 }
 
@@ -101,15 +120,25 @@ func (r *ToolRegistry) AvailableTools() []api.ToolDefinition {
 	return defs
 }
 
+// GetSpec returns the tool spec for a given name.
+func (r *ToolRegistry) GetSpec(name string) (*ToolSpec, bool) {
+	s, ok := r.specs[name]
+	return s, ok
+}
+
+// bashTool creates the bash tool spec.
 func bashTool() *ToolSpec {
 	return &ToolSpec{
-		Name:        "bash",
+		Name:       "bash",
+		Permission: PermDangerFullAccess,
 		Description: "Execute a bash command and return the output.",
 		InputSchema: map[string]interface{}{
 			"type": "object",
 			"properties": map[string]interface{}{
-				"command": map[string]interface{}{"type": "string", "description": "The bash command to execute"},
-				"timeout": map[string]interface{}{"type": "integer", "description": "Timeout in milliseconds (default 120000)"},
+				"command":     map[string]interface{}{"type": "string", "description": "The bash command to execute"},
+				"timeout":     map[string]interface{}{"type": "integer", "description": "Timeout in milliseconds (default 120000)"},
+				"description": map[string]interface{}{"type": "string", "description": "What this command does"},
+				"run_in_background": map[string]interface{}{"type": "boolean", "description": "Run in background"},
 			},
 			"required": []string{"command"},
 		},
@@ -119,11 +148,19 @@ func bashTool() *ToolSpec {
 			if t, ok := input["timeout"].(float64); ok && t > 0 {
 				timeoutMs = int(t)
 			}
+			runBg := false
+			if b, ok := input["run_in_background"].(bool); ok {
+				runBg = b
+			}
 
 			ctx, cancel := context.WithTimeout(context.Background(), time.Duration(timeoutMs)*time.Millisecond)
 			defer cancel()
 
 			execCmd := exec.CommandContext(ctx, "bash", "-c", cmd)
+			if runBg {
+				execCmd.Start()
+				return fmt.Sprintf("started in background (pid %d)", execCmd.Process.Pid), nil
+			}
 			out, err := execCmd.CombinedOutput()
 			if ctx.Err() == context.DeadlineExceeded {
 				return string(out) + "\n[timeout]", nil
@@ -135,14 +172,15 @@ func bashTool() *ToolSpec {
 
 func readTool() *ToolSpec {
 	return &ToolSpec{
-		Name:        "read_file",
+		Name:       "read_file",
+		Permission: PermReadOnly,
 		Description: "Read a file from the filesystem.",
 		InputSchema: map[string]interface{}{
 			"type": "object",
 			"properties": map[string]interface{}{
-				"path":    map[string]interface{}{"type": "string", "description": "Absolute file path"},
-				"offset":  map[string]interface{}{"type": "integer", "description": "Start line (0-indexed)"},
-				"limit":   map[string]interface{}{"type": "integer", "description": "Number of lines to read"},
+				"path":   map[string]interface{}{"type": "string", "description": "Absolute file path"},
+				"offset": map[string]interface{}{"type": "integer", "description": "Start line (0-indexed)"},
+				"limit":  map[string]interface{}{"type": "integer", "description": "Number of lines to read"},
 			},
 			"required": []string{"path"},
 		},
@@ -176,7 +214,8 @@ func readTool() *ToolSpec {
 
 func writeTool() *ToolSpec {
 	return &ToolSpec{
-		Name:        "write_file",
+		Name:       "write_file",
+		Permission: PermWorkspaceWrite,
 		Description: "Write content to a file, creating it if needed.",
 		InputSchema: map[string]interface{}{
 			"type": "object",
@@ -203,7 +242,8 @@ func writeTool() *ToolSpec {
 
 func editTool() *ToolSpec {
 	return &ToolSpec{
-		Name:        "edit_file",
+		Name:       "edit_file",
+		Permission: PermWorkspaceWrite,
 		Description: "Replace a string in a file.",
 		InputSchema: map[string]interface{}{
 			"type": "object",
@@ -254,7 +294,8 @@ func editTool() *ToolSpec {
 
 func globTool() *ToolSpec {
 	return &ToolSpec{
-		Name:        "glob",
+		Name:       "glob",
+		Permission: PermReadOnly,
 		Description: "Find files matching a glob pattern.",
 		InputSchema: map[string]interface{}{
 			"type": "object",
@@ -281,26 +322,49 @@ func globTool() *ToolSpec {
 
 func grepTool() *ToolSpec {
 	return &ToolSpec{
-		Name:        "grep",
+		Name:       "grep",
+		Permission: PermReadOnly,
 		Description: "Search file contents with a regex pattern.",
 		InputSchema: map[string]interface{}{
 			"type": "object",
 			"properties": map[string]interface{}{
-				"pattern": map[string]interface{}{"type": "string", "description": "Regex pattern"},
-				"path":    map[string]interface{}{"type": "string", "description": "Directory to search"},
+				"pattern":    map[string]interface{}{"type": "string", "description": "Regex pattern"},
+				"path":       map[string]interface{}{"type": "string", "description": "Directory to search"},
+				"glob":       map[string]interface{}{"type": "string", "description": "File glob filter"},
+				"output_mode": map[string]interface{}{"type": "string", "enum": []string{"content", "files_with_matches", "count"}},
+				"-i":         map[string]interface{}{"type": "boolean", "description": "Case insensitive"},
+				"head_limit":  map[string]interface{}{"type": "integer", "description": "Max results"},
 			},
 			"required": []string{"pattern"},
 		},
 		Handler: func(input map[string]interface{}) (string, error) {
 			pattern, _ := input["pattern"].(string)
 			searchDir, _ := input["path"].(string)
+			caseInsensitive := false
+			if v, ok := input["-i"].(bool); ok {
+				caseInsensitive = v
+			}
+			headLimit := 250
+			if v, ok := input["head_limit"].(float64); ok && v > 0 {
+				headLimit = int(v)
+			}
 			if searchDir == "" {
 				searchDir = "."
 			}
 
-			re, err := regexp.Compile(pattern)
+			flags := ""
+			if caseInsensitive {
+				flags = "(?i)"
+			}
+			re, err := regexp.Compile(flags + pattern)
 			if err != nil {
 				return "", fmt.Errorf("invalid regex: %w", err)
+			}
+
+			globPattern, _ := input["glob"].(string)
+			outputMode, _ := input["output_mode"].(string)
+			if outputMode == "" {
+				outputMode = "content"
 			}
 
 			var matches []string
@@ -308,13 +372,30 @@ func grepTool() *ToolSpec {
 				if err != nil || d.IsDir() {
 					return nil
 				}
+				if globPattern != "" {
+					matched, _ := filepath.Match(globPattern, d.Name())
+					if !matched {
+						return nil
+					}
+				}
 				data, err := os.ReadFile(path)
 				if err != nil {
 					return nil
 				}
 				for i, line := range strings.Split(string(data), "\n") {
 					if re.MatchString(line) {
-						matches = append(matches, fmt.Sprintf("%s:%d:%s", path, i+1, line))
+						if outputMode == "content" {
+							matches = append(matches, fmt.Sprintf("%s:%d:%s", path, i+1, line))
+						} else if outputMode == "files_with_matches" {
+							matches = append(matches, path)
+							return nil
+						} else if outputMode == "count" {
+							matches = append(matches, path)
+							return nil
+						}
+						if len(matches) >= headLimit {
+							return nil
+						}
 					}
 				}
 				return nil

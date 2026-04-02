@@ -1,6 +1,7 @@
 package tools
 
 import (
+	"encoding/json"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -10,7 +11,8 @@ import (
 
 func sleepTool() *ToolSpec {
 	return &ToolSpec{
-		Name:        "sleep",
+		Name:       "sleep",
+		Permission: PermReadOnly,
 		Description: "Sleep for a specified duration.",
 		InputSchema: map[string]interface{}{
 			"type": "object",
@@ -35,7 +37,8 @@ func sleepTool() *ToolSpec {
 
 func toolSearchTool() *ToolSpec {
 	return &ToolSpec{
-		Name:        "ToolSearch",
+		Name:       "ToolSearch",
+		Permission: PermReadOnly,
 		Description: "Search for available tools by keyword.",
 		InputSchema: map[string]interface{}{
 			"type": "object",
@@ -46,43 +49,59 @@ func toolSearchTool() *ToolSpec {
 			"required": []string{"query"},
 		},
 		Handler: func(input map[string]interface{}) (string, error) {
-			query := strings.ToLower(fmt.Sprintf("%v", input["query"]))
+			query, _ := input["query"].(string)
 			maxResults := 10
 			if m, ok := input["max_results"].(float64); ok && m > 0 {
 				maxResults = int(m)
 			}
 
-			var matches []string
-			for name, spec := range globalRegistry.specs {
-				if strings.Contains(strings.ToLower(name), query) ||
-					strings.Contains(strings.ToLower(spec.Description), query) {
-					matches = append(matches, fmt.Sprintf("- %s: %s", name, spec.Description))
+			if strings.HasPrefix(query, "select:") {
+				names := strings.Split(strings.TrimPrefix(query, "select:"), ",")
+				var results []string
+				for _, n := range names {
+					n = strings.TrimSpace(n)
+					if spec, ok := globalRegistry.specs[n]; ok {
+						results = append(results, fmt.Sprintf("- %s: %s [perm=%s]", spec.Name, spec.Description, permName(spec.Permission)))
+					}
 				}
-				if len(matches) >= maxResults {
+				if len(results) == 0 {
+					return "No tools found.", nil
+				}
+				return strings.Join(results, "\n"), nil
+			}
+
+			lowerQuery := strings.ToLower(query)
+			var results []string
+			for name, spec := range globalRegistry.specs {
+				if strings.Contains(strings.ToLower(name), lowerQuery) ||
+					strings.Contains(strings.ToLower(spec.Description), lowerQuery) {
+					results = append(results, fmt.Sprintf("- %s: %s [perm=%s]", name, spec.Description, permName(spec.Permission)))
+				}
+				if len(results) >= maxResults {
 					break
 				}
 			}
-
-			if len(matches) == 0 {
+			if len(results) == 0 {
 				return "No tools found matching query.", nil
 			}
-			return strings.Join(matches, "\n"), nil
+			return strings.Join(results, "\n"), nil
 		},
 	}
 }
 
 func notebookEditTool() *ToolSpec {
 	return &ToolSpec{
-		Name:        "NotebookEdit",
+		Name:       "NotebookEdit",
+		Permission: PermWorkspaceWrite,
 		Description: "Edit a Jupyter notebook cell.",
 		InputSchema: map[string]interface{}{
 			"type": "object",
 			"properties": map[string]interface{}{
 				"notebook_path": map[string]interface{}{"type": "string", "description": "Absolute path to the .ipynb file"},
 				"cell_id":       map[string]interface{}{"type": "string", "description": "Cell ID to edit"},
-				"new_source":    map[string]interface{}{"type": "string", "description": "New cell source content"},
-				"cell_type":     map[string]interface{}{"type": "string", "enum": []string{"code", "markdown"}},
-				"edit_mode":     map[string]interface{}{"type": "string", "enum": []string{"replace", "insert", "delete"}},
+				"new_source":    map[string]interface{}{"type": "string", "description": "New cell source"},
+				"cell_type":     map[string]interface{}{"type": "string", "description": "code or markdown"},
+				"edit_mode":     map[string]interface{}{"type": "string", "description": "replace, insert, or delete"},
 			},
 			"required": []string{"notebook_path", "new_source"},
 		},
@@ -93,38 +112,79 @@ func notebookEditTool() *ToolSpec {
 				return "", fmt.Errorf("notebook_path is required")
 			}
 			if !strings.HasSuffix(path, ".ipynb") {
-				return "", fmt.Errorf("file must be a .ipynb file")
+				return "", fmt.Errorf("file must be .ipynb")
 			}
 
-			// Read existing notebook or create new
 			data, err := os.ReadFile(path)
 			if err != nil {
-				// Create new notebook
-				notebook := fmt.Sprintf(`{"cells":[{"cell_type":"code","source":%q,"metadata":{},"execution_count":null,"outputs":[]}],"metadata":{"kernelspec":{"display_name":"Python 3","language":"python","name":"python3"}},"nbformat":4,"nbformat_minor":5}`, newSource)
-				dir := filepath.Dir(path)
-				os.MkdirAll(dir, 0755)
-				if err := os.WriteFile(path, []byte(notebook), 0644); err != nil {
-					return "", err
+				notebook := map[string]interface{}{
+					"cells": []interface{}{
+						map[string]interface{}{
+							"cell_type": "code", "source": newSource,
+							"metadata": map[string]interface{}{}, "execution_count": nil, "outputs": []interface{}{},
+						},
+					},
+					"metadata":    map[string]interface{}{},
+					"nbformat":    4, "nbformat_minor": 5,
 				}
-				return fmt.Sprintf("Created notebook %s", path), nil
+				os.MkdirAll(filepath.Dir(path), 0755)
+				nbData, _ := json.MarshalIndent(notebook, "", "  ")
+				os.WriteFile(path, nbData, 0644)
+				return "Created notebook: " + path, nil
 			}
 
-			// Simple cell replacement - find and replace source
-			content := string(data)
+			var notebook map[string]interface{}
+			json.Unmarshal(data, &notebook)
+			cells, _ := notebook["cells"].([]interface{})
 			cellID, _ := input["cell_id"].(string)
-			if cellID != "" {
-				// Find cell by ID and replace its source
-				return fmt.Sprintf("Would edit cell %s in %s", cellID, path), nil
+			editMode, _ := input["edit_mode"].(string)
+			if editMode == "" {
+				editMode = "replace"
 			}
 
-			// Append new cell
-			newCell := fmt.Sprintf(`{"cell_type":"code","source":%q,"metadata":{},"execution_count":null,"outputs":[]}`, newSource)
-			insertPoint := strings.LastIndex(content, `"cells": [`)
-			if insertPoint == -1 {
-				return "", fmt.Errorf("invalid notebook format")
+			switch editMode {
+			case "insert":
+				cellType, _ := input["cell_type"].(string)
+				if cellType == "" {
+					cellType = "code"
+				}
+				cells = append(cells, map[string]interface{}{
+					"cell_type": cellType, "source": newSource,
+					"metadata": map[string]interface{}{}, "execution_count": nil, "outputs": []interface{}{},
+				})
+				notebook["cells"] = cells
+			case "delete":
+				for i, c := range cells {
+					if cell, ok := c.(map[string]interface{}); ok {
+						if id, ok := cell["id"].(string); ok && id == cellID {
+							cells = append(cells[:i], cells[i+1:]...)
+							break
+						}
+					}
+				}
+				notebook["cells"] = cells
+			default:
+				if cellID != "" {
+					for i, c := range cells {
+						if cell, ok := c.(map[string]interface{}); ok {
+							if id, ok := cell["id"].(string); ok && id == cellID {
+								cell["source"] = newSource
+								cells[i] = cell
+								break
+							}
+						}
+					}
+				} else if len(cells) > 0 {
+					if cell, ok := cells[len(cells)-1].(map[string]interface{}); ok {
+						cell["source"] = newSource
+					}
+				}
+				notebook["cells"] = cells
 			}
-			_ = newCell
-			return fmt.Sprintf("Notebook edit at %s (cell append)", path), nil
+
+			nbData, _ := json.MarshalIndent(notebook, "", "  ")
+			os.WriteFile(path, nbData, 0644)
+			return fmt.Sprintf("Notebook edited: %s (%s)", path, editMode), nil
 		},
 	}
 }
