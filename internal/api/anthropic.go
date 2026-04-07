@@ -260,12 +260,32 @@ func (c *AnthropicClient) buildRequest(ctx context.Context, req *MessageRequest)
 		httpReq.Header.Set("anthropic-beta", "prompt-caching-2024-07-31")
 	}
 
-	// Set auth headers (mirrors Rust apply_auth_headers)
-	if c.auth.APIKey != "" {
-		httpReq.Header.Set("x-api-key", c.auth.APIKey)
-	}
-	if c.auth.BearerToken != "" {
-		httpReq.Header.Set("Authorization", "Bearer "+c.auth.BearerToken)
+	// Set auth headers based on provider method
+	switch c.auth.Method {
+	case AuthAWSSigV4:
+		if c.auth.BearerToken != "" {
+			httpReq.Header.Set("Authorization", "Bearer "+c.auth.BearerToken)
+		} else if c.auth.AWSCreds != nil {
+			signer := NewAWSSigner(c.auth.AWSCreds, c.auth.AWSRegion)
+			signer.SignRequest(httpReq)
+		}
+	case AuthGoogleADC:
+		if c.auth.GoogleToken != "" {
+			httpReq.Header.Set("Authorization", "Bearer "+c.auth.GoogleToken)
+		}
+	case AuthAzureToken:
+		if c.auth.APIKey != "" {
+			httpReq.Header.Set("api-key", c.auth.APIKey)
+		} else if c.auth.AzureToken != "" {
+			httpReq.Header.Set("Authorization", "Bearer "+c.auth.AzureToken)
+		}
+	default:
+		if c.auth.APIKey != "" {
+			httpReq.Header.Set("x-api-key", c.auth.APIKey)
+		}
+		if c.auth.BearerToken != "" {
+			httpReq.Header.Set("Authorization", "Bearer "+c.auth.BearerToken)
+		}
 	}
 
 	return httpReq, nil

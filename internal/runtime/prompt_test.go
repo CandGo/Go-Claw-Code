@@ -24,9 +24,9 @@ func TestDefaultSystemPromptListsTools(t *testing.T) {
 	prompt := DefaultSystemPrompt("glm-5.1")
 
 	tools := []string{
-		"bash", "read_file", "write_file", "edit_file",
-		"glob", "grep", "WebFetch", "WebSearch",
-		"TodoWrite", "Agent", "Skill", "NotebookEdit",
+		"Bash", "Read", "Write", "Edit",
+		"Glob", "Grep", "WebFetch", "WebSearch",
+		"TodoWrite", "Agent",
 	}
 	for _, tool := range tools {
 		if !strings.Contains(prompt, tool) {

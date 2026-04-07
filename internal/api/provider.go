@@ -63,6 +63,11 @@ func MaxTokensForModel(model string) int {
 // URL takes priority: if the URL is an Anthropic-compatible endpoint, use AnthropicClient
 // regardless of model name (e.g. GLM via /api/anthropic).
 func NewProvider(model string, auth *AuthSource, baseURL string) Provider {
+	// Cloud providers use Anthropic protocol with custom auth
+	if auth != nil && (auth.Method == AuthAWSSigV4 || auth.Method == AuthGoogleADC || auth.Method == AuthAzureToken) {
+		return NewAnthropicClient(baseURL, auth, model)
+	}
+
 	// URL-based detection first — URL determines the protocol
 	lowerURL := strings.ToLower(baseURL)
 	if strings.Contains(lowerURL, "anthropic") {
