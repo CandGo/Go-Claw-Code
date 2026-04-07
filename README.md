@@ -1,5 +1,7 @@
 # Go-Claw-Code
 
+**English** | [中文](README_CN.md)
+
 A Go reimplementation of [Claude Code](https://docs.anthropic.com/en/docs/claude-code) — Anthropic's agentic coding CLI.
 
 **96 Go files · 34K lines · 4 direct dependencies · zero AI SDKs** — raw Anthropic HTTP API with SSE streaming.
