@@ -14,7 +14,7 @@ import (
 	"github.com/go-claw/claw/internal/runtime"
 )
 
-// Server provides an HTTP/SSE API for Claw Code.
+// Server provides an HTTP/SSE API for Go-Claw-Code.
 type Server struct {
 	rt       *runtime.ConversationRuntime
 	port     int
@@ -90,6 +90,9 @@ func (s *Server) handleMessages(w http.ResponseWriter, r *http.Request) {
 }
 
 // handleMessagesStream handles POST /v1/messages/stream (SSE streaming).
+// Uses a channel-based approach so that each TurnOutput is sent to the
+// client as soon as it is produced by the runtime, instead of waiting for
+// the entire turn to complete.
 func (s *Server) handleMessagesStream(w http.ResponseWriter, r *http.Request) {
 	if r.Method != "POST" {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
@@ -118,26 +121,40 @@ func (s *Server) handleMessagesStream(w http.ResponseWriter, r *http.Request) {
 	ctx, cancel := context.WithTimeout(r.Context(), 5*time.Minute)
 	defer cancel()
 
-	// Run turn and stream results
-	outputs, usage, err := s.rt.RunTurn(ctx, req.Prompt)
+	// Buffered channels so the runtime goroutine is not blocked by slow writes.
+	outCh := make(chan runtime.TurnOutput, 16)
+	usageCh := make(chan runtime.TokenUsage, 1)
+	errCh := make(chan error, 1)
 
-	// Stream each output as SSE event
-	for _, out := range outputs {
+	// Launch the turn in a goroutine.  Each TurnOutput is sent to outCh as
+	// soon as it is produced, giving us true streaming behaviour.
+	go s.rt.RunTurnStreaming(ctx, req.Prompt, outCh, usageCh, errCh)
+
+	// Read outputs as they arrive and write SSE events immediately.
+	for out := range outCh {
 		data, _ := json.Marshal(out)
 		fmt.Fprintf(w, "event: output\ndata: %s\n\n", data)
 		flusher.Flush()
 	}
 
-	// Send usage
-	if usage != nil {
+	// Send usage if available.
+	select {
+	case usage := <-usageCh:
 		data, _ := json.Marshal(usage)
 		fmt.Fprintf(w, "event: usage\ndata: %s\n\n", data)
 		flusher.Flush()
+	default:
 	}
 
-	if err != nil {
-		data, _ := json.Marshal(map[string]string{"error": err.Error()})
-		fmt.Fprintf(w, "event: error\ndata: %s\n\n", data)
+	// Send error if the turn failed.
+	select {
+	case err := <-errCh:
+		if err != nil {
+			data, _ := json.Marshal(map[string]string{"error": err.Error()})
+			fmt.Fprintf(w, "event: error\ndata: %s\n\n", data)
+			flusher.Flush()
+		}
+	default:
 	}
 
 	fmt.Fprintf(w, "event: done\ndata: {}\n\n")

@@ -216,6 +216,38 @@ func (c *HTTPClient) ListResources(ctx context.Context) ([]Resource, error) {
 	return result.Resources, nil
 }
 
+// ReadResource reads a specific resource from the MCP server.
+func (c *HTTPClient) ReadResource(ctx context.Context, uri string) (string, error) {
+	params := map[string]interface{}{
+		"uri": uri,
+	}
+
+	resp, err := c.call(ctx, "resources/read", params)
+	if err != nil {
+		return "", err
+	}
+
+	var result struct {
+		Contents []struct {
+			URI      string `json:"uri"`
+			MimeType string `json:"mimeType,omitempty"`
+			Text     string `json:"text,omitempty"`
+			Blob     string `json:"blob,omitempty"`
+		} `json:"contents"`
+	}
+	if err := json.Unmarshal(resp.Result, &result); err != nil {
+		return "", fmt.Errorf("failed to parse resource: %w", err)
+	}
+
+	var texts []string
+	for _, c := range result.Contents {
+		if c.Text != "" {
+			texts = append(texts, c.Text)
+		}
+	}
+	return strings.Join(texts, "\n"), nil
+}
+
 // Tools returns the cached tool list.
 func (c *HTTPClient) Tools() []Tool {
 	return c.tools

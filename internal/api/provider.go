@@ -60,13 +60,16 @@ func MaxTokensForModel(model string) int {
 }
 
 // NewProvider creates the appropriate provider based on model name and config.
+// URL takes priority: if the URL is an Anthropic-compatible endpoint, use AnthropicClient
+// regardless of model name (e.g. GLM via /api/anthropic).
 func NewProvider(model string, auth *AuthSource, baseURL string) Provider {
-	// If the base URL suggests Anthropic-compatible API, always use Anthropic client
+	// URL-based detection first — URL determines the protocol
 	lowerURL := strings.ToLower(baseURL)
 	if strings.Contains(lowerURL, "anthropic") {
 		return NewAnthropicClient(baseURL, auth, model)
 	}
 
+	// Model-based detection for non-Anthropic URLs
 	kind := DetectProviderKind(model)
 	switch kind {
 	case ProviderOpenAI, ProviderXAI:

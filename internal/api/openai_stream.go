@@ -21,55 +21,57 @@ type oaiStreamChunk struct {
 }
 
 type oaiStreamDelta struct {
-	Role      string           `json:"role,omitempty"`
-	Content   *string          `json:"content,omitempty"`
-	ToolCalls []oaiStreamTool  `json:"tool_calls,omitempty"`
+	Role      string          `json:"role,omitempty"`
+	Content   *string         `json:"content,omitempty"`
+	ToolCalls []oaiStreamTool `json:"tool_calls,omitempty"`
 }
 
 type oaiStreamTool struct {
-	Index    int              `json:"index"`
-	ID       string           `json:"id,omitempty"`
-	Type     string           `json:"type,omitempty"`
-	Function oaiStreamFuncCall `json:"function"`
-}
-
-type oaiStreamFuncCall struct {
-	Name      string `json:"name,omitempty"`
-	Arguments string `json:"arguments,omitempty"`
+	Index   int    `json:"index"`
+	ID      string `json:"id,omitempty"`
+	Type    string `json:"type,omitempty"`
+	Function struct {
+		Name      string `json:"name,omitempty"`
+		Arguments string `json:"arguments,omitempty"`
+	} `json:"function"`
 }
 
 type oaiStreamUsage struct {
 	PromptTokens     int `json:"prompt_tokens"`
 	CompletionTokens int `json:"completion_tokens"`
-	TotalTokens      int `json:"total_tokens"`
+}
+
+// toolCallAccum accumulates incremental tool call deltas across chunks.
+type toolCallAccum struct {
+	id        strings.Builder
+	name      strings.Builder
+	arguments strings.Builder
+	started   bool
 }
 
 // translateOpenAIStream reads OpenAI SSE chunks and emits Anthropic-format SSEFrames.
-// This is the key bridge: OpenAI uses choices[0].delta.content and choices[0].delta.tool_calls,
-// while Anthropic uses content_block_start/delta/stop events.
 func translateOpenAIStream(r io.Reader) <-chan SSEFrame {
 	ch := make(chan SSEFrame, 64)
 	go func() {
 		defer close(ch)
+		if closer, ok := r.(io.Closer); ok {
+			defer closer.Close()
+		}
 		scanner := bufio.NewScanner(r)
 		scanner.Buffer(make([]byte, 0, 64*1024), 1024*1024)
 
-		// State for accumulating tool calls across chunks
-		type toolAccum struct {
-			ID        strings.Builder
-			Name      strings.Builder
-			Arguments strings.Builder
-			Started   bool
-		}
-		toolAccums := make(map[int]*toolAccum)
+		frameCount := 0
+
+		toolAccums := make(map[int]*toolCallAccum)
 		contentStarted := false
+		messageStarted := false
 		msgID := "msg_openai"
 		inputTokens := 0
+		outputTokens := 0
 
 		for scanner.Scan() {
 			line := scanner.Text()
-
-			// SSE lines start with "data: "
+			frameCount++
 			if !strings.HasPrefix(line, "data: ") {
 				continue
 			}
@@ -77,18 +79,17 @@ func translateOpenAIStream(r io.Reader) <-chan SSEFrame {
 
 			// Stream end
 			if data == "[DONE]" {
-				// Flush any pending content
 				if contentStarted {
 					ch <- SSEFrame{Event: "event", Data: `{"type":"content_block_stop","index":0}`}
 				}
-				// Flush any pending tool calls
 				for idx, ta := range toolAccums {
-					if ta.Started {
+					if ta.started {
 						ch <- SSEFrame{Event: "event", Data: fmt.Sprintf(
 							`{"type":"content_block_stop","index":%d}`, idx+1)}
 					}
 				}
-				ch <- SSEFrame{Event: "event", Data: `{"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":0}}`}
+				ch <- SSEFrame{Event: "event", Data: fmt.Sprintf(
+					`{"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":%d}}`, outputTokens)}
 				ch <- SSEFrame{Event: "event", Data: `{"type":"message_stop"}`}
 				return
 			}
@@ -101,26 +102,25 @@ func translateOpenAIStream(r io.Reader) <-chan SSEFrame {
 			if chunk.ID != "" {
 				msgID = chunk.ID
 			}
-
-			// Usage from final chunk
 			if chunk.Usage != nil {
 				inputTokens = chunk.Usage.PromptTokens
+				outputTokens = chunk.Usage.CompletionTokens
 			}
 
 			if len(chunk.Choices) == 0 {
 				continue
 			}
-
 			choice := chunk.Choices[0]
 
 			// Emit message_start on first chunk with role
-			if choice.Delta.Role == "assistant" && !contentStarted && len(toolAccums) == 0 {
+			if choice.Delta.Role == "assistant" && !messageStarted {
+				messageStarted = true
 				ch <- SSEFrame{Event: "event", Data: fmt.Sprintf(
 					`{"type":"message_start","message":{"id":"%s","type":"message","role":"assistant","usage":{"input_tokens":%d,"output_tokens":0}}}`,
 					msgID, inputTokens)}
 			}
 
-			// Handle text content
+			// Text content
 			if choice.Delta.Content != nil && *choice.Delta.Content != "" {
 				text := *choice.Delta.Content
 				if !contentStarted {
@@ -133,11 +133,11 @@ func translateOpenAIStream(r io.Reader) <-chan SSEFrame {
 					string(escaped))}
 			}
 
-			// Handle tool calls
+			// Tool calls
 			for _, tc := range choice.Delta.ToolCalls {
 				idx := tc.Index
 				if toolAccums[idx] == nil {
-					toolAccums[idx] = &toolAccum{}
+					toolAccums[idx] = &toolCallAccum{}
 				}
 				ta := toolAccums[idx]
 
@@ -148,22 +148,22 @@ func translateOpenAIStream(r io.Reader) <-chan SSEFrame {
 				}
 
 				// New tool call: emit content_block_start
-				if tc.ID != "" && !ta.Started {
-					ta.Started = true
-					ta.ID.WriteString(tc.ID)
+				if tc.ID != "" && !ta.started {
+					ta.started = true
+					ta.id.WriteString(tc.ID)
 					if tc.Function.Name != "" {
-						ta.Name.WriteString(tc.Function.Name)
+						ta.name.WriteString(tc.Function.Name)
 					}
-					blockIdx := idx + 1 // text is index 0
-					name, _ := json.Marshal(ta.Name.String())
+					blockIdx := idx + 1
+					escapedName, _ := json.Marshal(ta.name.String())
 					ch <- SSEFrame{Event: "event", Data: fmt.Sprintf(
 						`{"type":"content_block_start","index":%d,"content_block":{"type":"tool_use","id":"%s","name":%s,"input":{}}}`,
-						blockIdx, tc.ID, string(name))}
+						blockIdx, tc.ID, string(escapedName))}
 				}
 
 				// Accumulate arguments
 				if tc.Function.Arguments != "" {
-					ta.Arguments.WriteString(tc.Function.Arguments)
+					ta.arguments.WriteString(tc.Function.Arguments)
 					blockIdx := idx + 1
 					escaped, _ := json.Marshal(tc.Function.Arguments)
 					ch <- SSEFrame{Event: "event", Data: fmt.Sprintf(
@@ -172,10 +172,9 @@ func translateOpenAIStream(r io.Reader) <-chan SSEFrame {
 				}
 			}
 
-			// Handle finish
-			if choice.FinishReason != nil {
+			// Handle finish reason
+			if choice.FinishReason != nil && *choice.FinishReason != "" {
 				reason := *choice.FinishReason
-				// Map OpenAI finish reasons to Anthropic stop reasons
 				stopReason := "end_turn"
 				if reason == "tool_calls" {
 					stopReason = "tool_use"
@@ -189,17 +188,17 @@ func translateOpenAIStream(r io.Reader) <-chan SSEFrame {
 
 				// Close any open tool call blocks
 				for idx, ta := range toolAccums {
-					if ta.Started {
+					if ta.started {
 						ch <- SSEFrame{Event: "event", Data: fmt.Sprintf(
 							`{"type":"content_block_stop","index":%d}`, idx+1)}
-						ta.Started = false
+						ta.started = false
 					}
 				}
 
 				escaped, _ := json.Marshal(stopReason)
 				ch <- SSEFrame{Event: "event", Data: fmt.Sprintf(
-					`{"type":"message_delta","delta":{"stop_reason":%s},"usage":{"output_tokens":0}}`,
-					string(escaped))}
+					`{"type":"message_delta","delta":{"stop_reason":%s},"usage":{"output_tokens":%d}}`,
+					string(escaped), outputTokens)}
 				ch <- SSEFrame{Event: "event", Data: `{"type":"message_stop"}`}
 				return
 			}

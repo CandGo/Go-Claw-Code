@@ -14,44 +14,90 @@ func configTool() *ToolSpec {
 	return &ToolSpec{
 		Name:       "Config",
 		Permission: PermWorkspaceWrite,
-		Description: "Read or write configuration settings (theme, editorMode, verbose, permissions).",
+		Description: "Read or write configuration settings. 16 validated settings: theme, editorMode, verbose, preferredNotifChannel, autoCompactEnabled, autoMemoryEnabled, autoDreamEnabled, fileCheckpointingEnabled, showTurnDuration, terminalProgressBarEnabled, todoFeatureEnabled, model, alwaysThinkingEnabled, permissions.defaultMode, language, teammateMode.",
 		InputSchema: map[string]interface{}{
-			"type": "object",
+			"type":                 "object",
+			"additionalProperties": false,
 			"properties": map[string]interface{}{
 				"setting": map[string]interface{}{"type": "string", "description": "Setting name (e.g. theme, editorMode, verbose, permissions.defaultMode)"},
-				"value":   map[string]interface{}{"type": "string", "description": "Value to set (omit to read)"},
+				"value":   map[string]interface{}{"description": "Value to set (omit to read). Accepts string, boolean, or number."},
 			},
 			"required": []string{"setting"},
 		},
 		Handler: func(input map[string]interface{}) (string, error) {
 			setting, _ := input["setting"].(string)
-			value, _ := input["value"].(string)
+			if setting == "" {
+				return "", fmt.Errorf("setting is required")
+			}
 
-			home, _ := os.UserHomeDir()
-			configDir := filepath.Join(home, ".claw")
-			configPath := filepath.Join(configDir, "settings.json")
+			// Validate setting name
+			spec, err := validateConfigSetting(setting)
+			if err != nil {
+				return "", err
+			}
 
+			configPath := configFilePath(spec.Scope)
 			configData := map[string]interface{}{}
 			if data, err := os.ReadFile(configPath); err == nil {
 				json.Unmarshal(data, &configData)
 			}
 
-			if value == "" {
+			// Check if value is provided
+			valueRaw, hasValue := input["value"]
+
+			if !hasValue {
+				// Read mode
 				val := getConfigValue(configData, setting)
 				if val == nil {
-					return fmt.Sprintf("%s: (not set)", setting), nil
+					return fmt.Sprintf("%s: (not set) [%s, %s]", setting, spec.Kind, spec.Scope), nil
 				}
-				return fmt.Sprintf("%s: %v", setting, val), nil
+				return fmt.Sprintf("%s: %v [%s, %s]", setting, val, spec.Kind, spec.Scope), nil
 			}
 
-			os.MkdirAll(configDir, 0755)
-			setConfigValue(configData, setting, value)
+			// Write mode - normalize value
+			var valueStr string
+			switch v := valueRaw.(type) {
+			case string:
+				valueStr = v
+			case bool:
+				valueStr = fmt.Sprintf("%t", v)
+			case float64:
+				valueStr = fmt.Sprintf("%v", v)
+			default:
+				valueStr = fmt.Sprintf("%v", v)
+			}
+
+			normalized, err := normalizeConfigValue(spec, valueStr)
+			if err != nil {
+				return "", err
+			}
+
+			os.MkdirAll(filepath.Dir(configPath), 0755)
+			setConfigValueTyped(configData, spec.Path, normalized)
 			data, _ := json.MarshalIndent(configData, "", "  ")
 			if err := os.WriteFile(configPath, data, 0644); err != nil {
 				return "", err
 			}
-			return fmt.Sprintf("Set %s = %s", setting, value), nil
+			return fmt.Sprintf("Set %s = %v [%s, %s]", setting, normalized, spec.Kind, spec.Scope), nil
 		},
+	}
+}
+
+// setConfigValueTyped sets a value at a nested path using typed segments.
+func setConfigValueTyped(data map[string]interface{}, path []string, value interface{}) {
+	current := data
+	for i, part := range path {
+		if i == len(path)-1 {
+			current[part] = value
+			return
+		}
+		if next, ok := current[part].(map[string]interface{}); ok {
+			current = next
+		} else {
+			newMap := map[string]interface{}{}
+			current[part] = newMap
+			current = newMap
+		}
 	}
 }
 
@@ -61,10 +107,8 @@ func structuredOutputTool() *ToolSpec {
 		Permission: PermReadOnly,
 		Description: "Output structured data as JSON. Passes input through as-is.",
 		InputSchema: map[string]interface{}{
-			"type": "object",
-			"properties": map[string]interface{}{
-				"data": map[string]interface{}{"type": "object", "description": "Structured data to output"},
-			},
+			"type":                 "object",
+			"additionalProperties": true,
 		},
 		Handler: func(input map[string]interface{}) (string, error) {
 			data, err := json.MarshalIndent(input, "", "  ")
@@ -82,11 +126,12 @@ func replTool() *ToolSpec {
 		Permission: PermDangerFullAccess,
 		Description: "Execute code in a runtime (python, javascript, shell).",
 		InputSchema: map[string]interface{}{
-			"type": "object",
+			"type":                 "object",
+			"additionalProperties": false,
 			"properties": map[string]interface{}{
 				"code":       map[string]interface{}{"type": "string", "description": "Code to execute"},
 				"language":   map[string]interface{}{"type": "string", "description": "Runtime: python, javascript, shell"},
-				"timeout_ms": map[string]interface{}{"type": "integer", "description": "Timeout in ms (default 30000)"},
+				"timeout_ms": map[string]interface{}{"type": "integer", "description": "Timeout in ms (default 30000)", "minimum": 0},
 			},
 			"required": []string{"code", "language"},
 		},
@@ -108,10 +153,11 @@ func powershellTool() *ToolSpec {
 		Permission: PermDangerFullAccess,
 		Description: "Execute a PowerShell command. Detects pwsh or powershell automatically.",
 		InputSchema: map[string]interface{}{
-			"type": "object",
+			"type":                 "object",
+			"additionalProperties": false,
 			"properties": map[string]interface{}{
 				"command":        map[string]interface{}{"type": "string", "description": "PowerShell command"},
-				"timeout":        map[string]interface{}{"type": "integer", "description": "Timeout in ms (default 120000)"},
+				"timeout":        map[string]interface{}{"type": "integer", "description": "Timeout in ms (default 120000)", "minimum": 0},
 				"description":    map[string]interface{}{"type": "string", "description": "What this command does"},
 				"run_in_background": map[string]interface{}{"type": "boolean", "description": "Run in background"},
 			},
@@ -148,10 +194,6 @@ func runREPLCode(code, lang string, timeoutMs int) (string, error) {
 		return "", fmt.Errorf("unsupported language: %s (use python, javascript, shell)", lang)
 	}
 
-	if timeoutMs > 0 {
-		// Simple timeout via context
-	}
-
 	out, err := cmd.CombinedOutput()
 	return string(out), err
 }
@@ -165,6 +207,7 @@ func runPowerShell(command string, timeoutMs int) (string, error) {
 	}
 
 	cmd := exec.Command(psExe, "-NoProfile", "-Command", command)
+	setProcessFlags(cmd)
 	out, err := cmd.CombinedOutput()
 	return string(out), err
 }

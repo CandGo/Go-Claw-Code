@@ -3,6 +3,7 @@ package tools
 import (
 	"encoding/json"
 	"fmt"
+	"strings"
 	"sync"
 )
 
@@ -24,17 +25,19 @@ func todoWriteTool() *ToolSpec {
 		Description: "Update the todo list to track progress on tasks.",
 		InputSchema: map[string]interface{}{
 			"type": "object",
+			"additionalProperties": false,
 			"properties": map[string]interface{}{
 				"todos": map[string]interface{}{
 					"type": "array",
 					"items": map[string]interface{}{
 						"type": "object",
 						"properties": map[string]interface{}{
-							"content":    map[string]interface{}{"type": "string"},
+							"content":    map[string]interface{}{"type": "string", "minLength": 1},
 							"status":     map[string]interface{}{"type": "string", "enum": []string{"pending", "in_progress", "completed"}},
-							"activeForm": map[string]interface{}{"type": "string"},
+							"activeForm": map[string]interface{}{"type": "string", "minLength": 1},
 						},
-						"required": []string{"content", "status"},
+						"required": []string{"content", "status", "activeForm"},
+						"additionalProperties": false,
 					},
 				},
 			},
@@ -60,7 +63,20 @@ func todoWriteTool() *ToolSpec {
 			}
 
 			todoItems = items
-			return fmt.Sprintf("Updated %d todo items", len(items)), nil
+			var lines []string
+			for i, item := range items {
+				icon := " "
+				switch item.Status {
+				case "completed":
+					icon = "x"
+				case "in_progress":
+					icon = ">"
+				default:
+					icon = "o"
+				}
+				lines = append(lines, fmt.Sprintf("  %s %d. %s", icon, i+1, item.Content))
+			}
+			return fmt.Sprintf("Updated %d todo items:\n%s", len(items), strings.Join(lines, "\n")), nil
 		},
 	}
 }

@@ -2,12 +2,14 @@ package tools
 
 import (
 	"context"
+	"encoding/base64"
 	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"regexp"
 	"strings"
+	"runtime"
 	"time"
 
 	"github.com/go-claw/claw/internal/api"
@@ -79,6 +81,35 @@ func NewToolRegistry() *ToolRegistry {
 	r.register(sleepTool())
 	r.register(toolSearchTool())
 	r.register(sendUserMessageTool())
+	r.register(askUserQuestionTool())
+	r.register(enterPlanModeTool())
+	r.register(exitPlanModeTool())
+	r.register(taskOutputTool())
+	r.register(taskStopTool())
+	r.register(clearScreenTool())
+	r.register(statusLineTool())
+
+	// Memory
+	r.register(writeMemoryTool())
+
+	// Cron
+	r.register(cronCreateTool())
+	r.register(cronDeleteTool())
+	r.register(cronListTool())
+
+	// MCP resources/prompts
+	r.register(mcpResourceTool())
+	r.register(mcpListResourcesTool())
+	r.register(mcpListPromptsTool())
+	r.register(mcpGetPromptTool())
+
+	// Worktree
+	r.register(worktreeCreateTool())
+	r.register(worktreeRemoveTool())
+
+	// Additional tools
+	r.register(multiEditTool())
+	r.register(todoReadTool())
 
 	// System tools
 	r.register(configTool())
@@ -105,11 +136,110 @@ func (r *ToolRegistry) RegisterDynamic(name, description string, inputSchema map
 	}
 }
 
+// planModeAllowedTools lists tools permitted during plan mode.
+var planModeAllowedTools = map[string]bool{
+	"read_file": true, "glob": true, "grep": true, "WebFetch": true, "WebSearch": true,
+	"ToolSearch": true, "Skill": true, "Agent": true, "TodoWrite": true,
+	"NotebookEdit": true, "SendUserMessage": true, "sleep": true,
+	"StructuredOutput": true, "EnterPlanMode": true, "ExitPlanMode": true,
+	"AskUserQuestion": true,
+}
+
+// planModeBashWhitelist prefixes allowed for bash in plan mode.
+var planModeBashWhitelist = []string{
+	"git status", "git diff", "git log", "git show", "git branch",
+	"cat ", "head ", "tail ", "ls", "find ", "wc ", "grep ", "which ",
+	"echo ", "pwd", "env", "node -e", "python -c",
+}
+
+// IsPlanModeActive returns whether plan mode is currently active.
+func IsPlanModeActive() bool {
+	return globalPlanModeActive
+}
+
+// toolAliases maps common LLM tool name variants to registered names.
+// Models like Claude use PascalCase (Read, Write, Bash), glm/deepseek may use
+// snake_case variants. All map to the actual registered names.
+var toolAliases = map[string]string{
+	// Claude Code style → actual registered names
+	"read":           "read_file",
+	"write":          "write_file",
+	"edit":           "edit_file",
+	"bash":           "bash",
+	"glob":           "glob",
+	"grep":           "grep",
+	// Common LLM variants → registered names
+	"create_file":    "write_file",
+	"run_command":    "bash",
+	"execute":        "bash",
+	"shell":          "bash",
+	"terminal":       "bash",
+	"search":         "grep",
+	"search_files":   "grep",
+	"find_files":     "glob",
+	"list_files":     "glob",
+	"find":           "glob",
+	"write_memory":   "WriteMemory",
+	"ask_user":       "AskUserQuestion",
+	"notebook_edit":  "NotebookEdit",
+	"task_output":    "TaskOutput",
+	"task_stop":      "TaskStop",
+	"tool_search":    "ToolSearch",
+	"web_fetch":      "WebFetch",
+	"web_search":     "WebSearch",
+	"web_reader":     "WebFetch",
+	"todo_write":     "TodoWrite",
+	"todo_read":      "TodoRead",
+	"plan_mode":      "EnterPlanMode",
+	"exit_plan":      "ExitPlanMode",
+	"send_message":   "SendUserMessage",
+}
+
 // Execute runs a tool by name.
 func (r *ToolRegistry) Execute(toolName string, input map[string]interface{}) (string, error) {
 	spec, ok := r.specs[toolName]
 	if !ok {
+		// Alias mapping for non-standard tool names (e.g. glm calls read_file instead of Read)
+		if alias, found := toolAliases[strings.ToLower(toolName)]; found {
+			spec, ok = r.specs[alias]
+			if ok {
+				toolName = alias
+			}
+		}
+	}
+	if !ok {
+		// Case-insensitive fallback for non-standard models (e.g. glm, deepseek)
+		lower := strings.ToLower(toolName)
+		for name, s := range r.specs {
+			if strings.ToLower(name) == lower {
+				spec = s
+				ok = true
+				toolName = name
+				break
+			}
+		}
+	}
+	if !ok {
 		return "", fmt.Errorf("unknown tool: %s", toolName)
+	}
+
+	// Plan mode restrictions
+	if globalPlanModeActive {
+		if toolName == "bash" {
+			cmd, _ := input["command"].(string)
+			allowed := false
+			for _, prefix := range planModeBashWhitelist {
+				if strings.HasPrefix(cmd, prefix) || cmd == strings.TrimSpace(prefix) {
+					allowed = true
+					break
+				}
+			}
+			if !allowed {
+				return "", fmt.Errorf("only read-only bash commands allowed in plan mode")
+			}
+		} else if !planModeAllowedTools[toolName] {
+			return "", fmt.Errorf("tool %s is not available in plan mode", toolName)
+		}
 	}
 
 	// Sandbox path validation for file tools
@@ -326,7 +456,13 @@ func bashTool() *ToolSpec {
 			ctx, cancel := context.WithTimeout(context.Background(), time.Duration(timeoutMs)*time.Millisecond)
 			defer cancel()
 
-			execCmd := exec.CommandContext(ctx, "bash", "-c", cmd)
+			var execCmd *exec.Cmd
+				if runtime.GOOS == "windows" {
+					execCmd = exec.CommandContext(ctx, "cmd.exe", "/c", cmd)
+				} else {
+					execCmd = exec.CommandContext(ctx, "bash", "-c", cmd)
+				}
+				execCmd.Stdin = strings.NewReader("")
 			if runBg {
 				execCmd.Start()
 				return fmt.Sprintf("started in background (pid %d)", execCmd.Process.Pid), nil
@@ -356,10 +492,51 @@ func readTool() *ToolSpec {
 		},
 		Handler: func(input map[string]interface{}) (string, error) {
 			path, _ := input["path"].(string)
+			if info, err := os.Stat(path); err == nil && info.IsDir() {
+				entries, err := os.ReadDir(path)
+				if err != nil {
+					return "", fmt.Errorf("failed to list directory %s: %w", path, err)
+				}
+				var lines []string
+				for _, e := range entries {
+					prefix := " "
+					if e.IsDir() { prefix = "d" }
+					lines = append(lines, prefix + " " + e.Name())
+				}
+				return strings.Join(lines, "\n"), nil
+			}
 			data, err := os.ReadFile(path)
 			if err != nil {
 				return "", fmt.Errorf("failed to read %s: %w", path, err)
 			}
+
+			// Image detection
+			ext := strings.ToLower(filepath.Ext(path))
+			imageExts := map[string]bool{".png": true, ".jpg": true, ".jpeg": true, ".gif": true, ".webp": true, ".bmp": true, ".svg": true}
+			if imageExts[ext] {
+				mime := "image/png"
+				switch ext {
+				case ".jpg", ".jpeg":
+					mime = "image/jpeg"
+				case ".gif":
+					mime = "image/gif"
+				case ".webp":
+					mime = "image/webp"
+				case ".bmp":
+					mime = "image/bmp"
+				case ".svg":
+					mime = "image/svg+xml"
+				}
+				b64 := base64.StdEncoding.EncodeToString(data)
+				return fmt.Sprintf("[Image: %s (%d bytes, %s)]\ndata:%s;base64,%s", filepath.Base(path), len(data), mime, mime, b64), nil
+			}
+
+			// PDF detection
+			if ext == ".pdf" {
+				b64 := base64.StdEncoding.EncodeToString(data)
+				return fmt.Sprintf("[PDF: %s (%d bytes)]\ndata:application/pdf;base64,%s", filepath.Base(path), len(data), b64), nil
+			}
+
 			lines := strings.Split(string(data), "\n")
 			offset := 0
 			if o, ok := input["offset"].(float64); ok && o > 0 {
@@ -375,7 +552,7 @@ func readTool() *ToolSpec {
 			}
 			var buf strings.Builder
 			for i := offset; i < end; i++ {
-				fmt.Fprintf(&buf, "%d\t%s\n", i+1, lines[i])
+				fmt.Fprintf(&buf, "%d	%s\n", i+1, lines[i])
 			}
 			return buf.String(), nil
 		},
@@ -504,6 +681,12 @@ func grepTool() *ToolSpec {
 				"output_mode": map[string]interface{}{"type": "string", "enum": []string{"content", "files_with_matches", "count"}},
 				"-i":         map[string]interface{}{"type": "boolean", "description": "Case insensitive"},
 				"head_limit":  map[string]interface{}{"type": "integer", "description": "Max results"},
+				"-B":         map[string]interface{}{"type": "integer", "description": "Lines before match"},
+				"-A":         map[string]interface{}{"type": "integer", "description": "Lines after match"},
+				"-C":         map[string]interface{}{"type": "integer", "description": "Context lines around match"},
+				"-n":         map[string]interface{}{"type": "boolean", "description": "Show line numbers"},
+				"type":       map[string]interface{}{"type": "string", "description": "File type filter"},
+				"multiline":  map[string]interface{}{"type": "boolean", "description": "Enable multiline matching"},
 			},
 			"required": []string{"pattern"},
 		},
@@ -534,7 +717,7 @@ func grepTool() *ToolSpec {
 			globPattern, _ := input["glob"].(string)
 			outputMode, _ := input["output_mode"].(string)
 			if outputMode == "" {
-				outputMode = "content"
+				outputMode = "files_with_matches"
 			}
 
 			var matches []string

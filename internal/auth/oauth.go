@@ -15,6 +15,7 @@ import (
 	"path/filepath"
 	"runtime"
 	"strings"
+	"time"
 )
 
 const (
@@ -26,11 +27,12 @@ const (
 
 // OAuthConfig holds OAuth PKCE configuration.
 type OAuthConfig struct {
-	ClientID      string `json:"client_id"`
-	AuthURL       string `json:"auth_url"`
-	TokenURL      string `json:"token_url"`
-	CallbackPort  int    `json:"callback_port"`
-	Scopes        string `json:"scopes"`
+	ClientID          string `json:"client_id"`
+	AuthURL           string `json:"auth_url"`
+	TokenURL          string `json:"token_url"`
+	CallbackPort      int    `json:"callback_port"`
+	ManualRedirectURL string `json:"manual_redirect_url,omitempty"` // for non-browser auth flows
+	Scopes            string `json:"scopes"`
 }
 
 // OAuthToken holds the OAuth token response.
@@ -41,6 +43,7 @@ type OAuthToken struct {
 	TokenType    string `json:"token_type"`
 	ExpiresIn    int    `json:"expires_in"`
 	Scope        string `json:"scope"`
+	ExpiresAtMs  int64  `json:"expires_at_ms,omitempty"` // Set after loading for expiry checks
 }
 
 // OAuthState holds PKCE state for an in-progress auth flow.
@@ -91,11 +94,14 @@ func StartAuthFlow(cfg OAuthConfig) (*OAuthToken, error) {
 		return nil, err
 	}
 
+	// Determine redirect URI
+	redirectURI := fmt.Sprintf("http://127.0.0.1:%d/callback", cfg.CallbackPort)
+
 	// Build auth URL
 	params := url.Values{}
 	params.Set("response_type", "code")
 	params.Set("client_id", cfg.ClientID)
-	params.Set("redirect_uri", fmt.Sprintf("http://127.0.0.1:%d/callback", cfg.CallbackPort))
+	params.Set("redirect_uri", redirectURI)
 	params.Set("scope", cfg.Scopes)
 	params.Set("state", pkce.State)
 	params.Set("code_challenge", pkce.Challenge)
@@ -136,6 +142,25 @@ func StartAuthFlow(cfg OAuthConfig) (*OAuthToken, error) {
 
 	listener, err := net.Listen("tcp", fmt.Sprintf("127.0.0.1:%d", cfg.CallbackPort))
 	if err != nil {
+		// If ManualRedirectURL is set, fall back to manual auth flow
+		if cfg.ManualRedirectURL != "" {
+			// Rebuild auth URL with the manual redirect
+			params.Set("redirect_uri", cfg.ManualRedirectURL)
+			authURL = cfg.AuthURL + "?" + params.Encode()
+			fmt.Printf("Callback server unavailable. Visit this URL to authenticate:\n\n%s\n\n", authURL)
+			fmt.Print("Paste the authorization code: ")
+			var code string
+			if _, scanErr := fmt.Scanln(&code); scanErr != nil {
+				return nil, fmt.Errorf("failed to read authorization code: %w", scanErr)
+			}
+			// Use manual redirect URI for token exchange
+			redirectURI = cfg.ManualRedirectURL
+			token, exchangeErr := exchangeCodeWithRedirect(cfg, code, pkce.Verifier, redirectURI)
+			if exchangeErr != nil {
+				return nil, exchangeErr
+			}
+			return token, nil
+		}
 		return nil, fmt.Errorf("failed to start callback server: %w", err)
 	}
 
@@ -159,11 +184,16 @@ func StartAuthFlow(cfg OAuthConfig) (*OAuthToken, error) {
 }
 
 func exchangeCode(cfg OAuthConfig, code, verifier string) (*OAuthToken, error) {
+	return exchangeCodeWithRedirect(cfg, code, verifier, fmt.Sprintf("http://127.0.0.1:%d/callback", cfg.CallbackPort))
+}
+
+// exchangeCodeWithRedirect exchanges an authorization code for a token using a custom redirect URI.
+func exchangeCodeWithRedirect(cfg OAuthConfig, code, verifier, redirectURI string) (*OAuthToken, error) {
 	data := url.Values{}
 	data.Set("grant_type", "authorization_code")
 	data.Set("code", code)
 	data.Set("client_id", cfg.ClientID)
-	data.Set("redirect_uri", fmt.Sprintf("http://127.0.0.1:%d/callback", cfg.CallbackPort))
+	data.Set("redirect_uri", redirectURI)
 	data.Set("code_verifier", verifier)
 
 	resp, err := http.PostForm(cfg.TokenURL, data)
@@ -186,6 +216,9 @@ func exchangeCode(cfg OAuthConfig, code, verifier string) (*OAuthToken, error) {
 		return nil, fmt.Errorf("failed to parse token response: %w", err)
 	}
 
+	// Compute absolute expiry from ExpiresIn
+	token.ComputeExpiry()
+
 	return &token, nil
 }
 
@@ -195,7 +228,7 @@ func SaveToken(token *OAuthToken) error {
 	if err != nil {
 		return err
 	}
-	dir := filepath.Join(home, ".claw")
+	dir := filepath.Join(home, ".go-claw")
 	os.MkdirAll(dir, 0700)
 
 	data, err := json.MarshalIndent(token, "", "  ")
@@ -211,7 +244,7 @@ func LoadToken() (*OAuthToken, error) {
 	if err != nil {
 		return nil, err
 	}
-	data, err := os.ReadFile(filepath.Join(home, ".claw", "oauth_token.json"))
+	data, err := os.ReadFile(filepath.Join(home, ".go-claw", "oauth_token.json"))
 	if err != nil {
 		return nil, err
 	}
@@ -245,8 +278,26 @@ func openBrowser(url string) error {
 }
 
 // ResolveAuthWithOAuth first tries API key, then falls back to OAuth token.
+// Mirrors Rust resolve_startup_auth_source — includes automatic token refresh.
 func ResolveAuthWithOAuth() (apiKey, bearerToken string, err error) {
-	// Try environment variables first
+	// 1. Try CLAW_* environment variables first (Go-Claw-Code specific)
+	apiKey = strings.TrimSpace(os.Getenv("CLAW_API_KEY"))
+	bearerToken = strings.TrimSpace(os.Getenv("CLAW_AUTH_TOKEN"))
+	if apiKey != "" || bearerToken != "" {
+		return apiKey, bearerToken, nil
+	}
+
+	// 2. Try file-based credentials (~/.go-claw/auth.json)
+	creds, credErr := LoadCredentials()
+	if credErr == nil && creds != nil && creds.APIKey != "" {
+		if creds.APIKey == "(claude-code)" {
+			// User chose to reuse Claude Code config — fall through to ANTHROPIC_* env vars
+		} else {
+			return creds.APIKey, "", nil
+		}
+	}
+
+	// 3. Try ANTHROPIC_* environment variables (fallback, compatible with Claude Code)
 	apiKey = strings.TrimSpace(os.Getenv("ANTHROPIC_API_KEY"))
 	bearerToken = strings.TrimSpace(os.Getenv("ANTHROPIC_AUTH_TOKEN"))
 	if apiKey != "" || bearerToken != "" {
@@ -255,9 +306,98 @@ func ResolveAuthWithOAuth() (apiKey, bearerToken string, err error) {
 
 	// Try OAuth token
 	token, err := LoadToken()
-	if err == nil && token.AccessToken != "" {
-		return "", token.AccessToken, nil
+	if err != nil || token.AccessToken == "" {
+		return "", "", fmt.Errorf("no credentials found; set CLAW_API_KEY or ANTHROPIC_API_KEY, or run 'claw --login'")
 	}
 
-	return "", "", fmt.Errorf("no credentials found; set ANTHROPIC_API_KEY or run 'claw auth'")
+	// Check expiry and attempt refresh
+	if token.IsExpired() {
+		if token.RefreshToken != "" {
+			refreshed, refreshErr := refreshToken(DefaultOAuthConfig(), token.RefreshToken)
+			if refreshErr != nil {
+				return "", "", fmt.Errorf("OAuth token expired and refresh failed: %w; run 'claw --login'", refreshErr)
+			}
+			// Save the refreshed token
+			if saveErr := SaveToken(refreshed); saveErr != nil {
+				// Non-fatal: we still have a valid token
+				_ = saveErr
+			}
+			return "", refreshed.AccessToken, nil
+		}
+		return "", "", fmt.Errorf("OAuth token expired with no refresh token; run 'claw --login'")
+	}
+
+	return "", token.AccessToken, nil
+}
+
+// refreshToken refreshes an OAuth token using the refresh_token grant.
+func refreshToken(cfg OAuthConfig, refreshTokenStr string) (*OAuthToken, error) {
+	data := url.Values{}
+	data.Set("grant_type", "refresh_token")
+	data.Set("refresh_token", refreshTokenStr)
+	data.Set("client_id", cfg.ClientID)
+
+	resp, err := http.PostForm(cfg.TokenURL, data)
+	if err != nil {
+		return nil, fmt.Errorf("refresh request failed: %w", err)
+	}
+	defer resp.Body.Close()
+
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, fmt.Errorf("reading refresh response: %w", err)
+	}
+
+	if resp.StatusCode != 200 {
+		return nil, fmt.Errorf("refresh returned %d: %s", resp.StatusCode, string(body))
+	}
+
+	var token OAuthToken
+	if err := json.Unmarshal(body, &token); err != nil {
+		return nil, fmt.Errorf("parsing refresh response: %w", err)
+	}
+
+	// Preserve refresh token if server doesn't return a new one
+	if token.RefreshToken == "" {
+		token.RefreshToken = refreshTokenStr
+	}
+
+	token.ComputeExpiry()
+	return &token, nil
+}
+
+// IsExpired checks if the OAuth token has expired.
+// Mirrors Rust oauth_token_is_expired.
+func (t *OAuthToken) IsExpired() bool {
+	if t.ExpiresAtMs > 0 {
+		return time.Now().UnixMilli() >= t.ExpiresAtMs
+	}
+	if t.ExpiresIn > 0 {
+		// No absolute expiry stored; assume still valid (we can't check without knowing when it was issued)
+		return false
+	}
+	return false
+}
+
+// ComputeExpiry computes ExpiresAtMs from ExpiresIn seconds if not already set.
+func (t *OAuthToken) ComputeExpiry() {
+	if t.ExpiresAtMs == 0 && t.ExpiresIn > 0 {
+		t.ExpiresAtMs = time.Now().Add(time.Duration(t.ExpiresIn) * time.Second).UnixMilli()
+	}
+}
+
+// HasAuthFromEnvOrSaved checks if any auth source is available.
+// Mirrors Rust has_auth_from_env_or_saved.
+func HasAuthFromEnvOrSaved() bool {
+	_, _, err := ResolveAuthWithOAuth()
+	return err == nil
+}
+
+// MaskedToken returns a masked version of a token for logging.
+// Mirrors Rust masked_authorization_header.
+func MaskedToken(token string) string {
+	if len(token) <= 8 {
+		return "****"
+	}
+	return token[:4] + "..." + token[len(token)-4:]
 }

@@ -8,12 +8,14 @@ import (
 	"io"
 	"os"
 	"os/exec"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
+	"time"
 )
 
-// Protocol types for JSON-RPC over stdio.
+// Protocol types for JSON-RPC over stdio with Content-Length framing.
 
 type jsonRPCRequest struct {
 	JSONRPC string      `json:"jsonrpc"`
@@ -58,30 +60,48 @@ type Resource struct {
 	MimeType    string `json:"mimeType,omitempty"`
 }
 
+// Prompt represents an MCP prompt template.
+type Prompt struct {
+	Name        string `json:"name"`
+	Description string `json:"description,omitempty"`
+}
+
+// PromptMessage is a message in a prompt template.
+type PromptMessage struct {
+	Role    string `json:"role"`
+	Content struct {
+		Type string `json:"type"`
+		Text string `json:"text,omitempty"`
+	} `json:"content"`
+}
+
 // ServerInfo holds server metadata from initialize.
 type ServerInfo struct {
 	Name    string `json:"name"`
 	Version string `json:"version"`
 }
 
-// Client is an MCP client that communicates over stdio JSON-RPC.
+// Client is an MCP client that communicates over stdio JSON-RPC
+// using Content-Length header framing per MCP specification.
 type Client struct {
-	cmd       *exec.Cmd
-	stdin     io.WriteCloser
-	stdout    *bufio.Reader
-	idCounter atomic.Int64
-	pending   map[int64]chan jsonRPCResponse
-	mu        sync.Mutex
-	tools     []Tool
-	resources []Resource
+	cmd        *exec.Cmd
+	stdin      io.WriteCloser
+	stdout     *bufio.Reader
+	idCounter  atomic.Int64
+	pending    map[int64]chan jsonRPCResponse
+	mu         sync.Mutex
+	tools      []Tool
+	resources  []Resource
+	prompts    []Prompt
 	serverInfo ServerInfo
+	writeMu    sync.Mutex // serialize writes to stdin
+	timeout    time.Duration
 }
 
 // NewClient creates a new MCP client by spawning the server command.
 func NewClient(ctx context.Context, command string, args []string, env map[string]string) (*Client, error) {
 	cmd := exec.CommandContext(ctx, command, args...)
 
-	// Set environment
 	cmd.Env = os.Environ()
 	for k, v := range env {
 		cmd.Env = append(cmd.Env, k+"="+v)
@@ -97,6 +117,9 @@ func NewClient(ctx context.Context, command string, args []string, env map[strin
 		return nil, fmt.Errorf("failed to create stdout pipe: %w", err)
 	}
 
+	// Redirect stderr for debugging
+	cmd.Stderr = os.Stderr
+
 	if err := cmd.Start(); err != nil {
 		return nil, fmt.Errorf("failed to start MCP server: %w", err)
 	}
@@ -106,9 +129,9 @@ func NewClient(ctx context.Context, command string, args []string, env map[strin
 		stdin:   stdin,
 		stdout:  bufio.NewReader(stdout),
 		pending: make(map[int64]chan jsonRPCResponse),
+		timeout: 30 * time.Second,
 	}
 
-	// Start reading responses
 	go client.readLoop()
 
 	return client, nil
@@ -118,10 +141,14 @@ func NewClient(ctx context.Context, command string, args []string, env map[strin
 func (c *Client) Initialize(ctx context.Context) error {
 	params := map[string]interface{}{
 		"protocolVersion": "2025-03-26",
-		"capabilities":    map[string]interface{}{},
+		"capabilities": map[string]interface{}{
+			"tools":     map[string]interface{}{},
+			"resources": map[string]interface{}{},
+			"prompts":   map[string]interface{}{},
+		},
 		"clientInfo": map[string]interface{}{
 			"name":    "claw-code-go",
-			"version": "0.4.0",
+			"version": "0.5.0",
 		},
 	}
 
@@ -131,9 +158,9 @@ func (c *Client) Initialize(ctx context.Context) error {
 	}
 
 	var initResult struct {
-		ProtocolVersion string     `json:"protocolVersion"`
+		ProtocolVersion string      `json:"protocolVersion"`
 		Capabilities    interface{} `json:"capabilities"`
-		ServerInfo      ServerInfo `json:"serverInfo"`
+		ServerInfo      ServerInfo  `json:"serverInfo"`
 	}
 	if err := json.Unmarshal(resp.Result, &initResult); err != nil {
 		return fmt.Errorf("failed to parse initialize response: %w", err)
@@ -141,7 +168,6 @@ func (c *Client) Initialize(ctx context.Context) error {
 
 	c.serverInfo = initResult.ServerInfo
 
-	// Send initialized notification
 	c.notify("notifications/initialized", nil)
 
 	return nil
@@ -217,9 +243,91 @@ func (c *Client) ListResources(ctx context.Context) ([]Resource, error) {
 	return result.Resources, nil
 }
 
+// ReadResource reads a specific resource from the MCP server.
+func (c *Client) ReadResource(ctx context.Context, uri string) (string, error) {
+	params := map[string]interface{}{
+		"uri": uri,
+	}
+
+	resp, err := c.call("resources/read", params)
+	if err != nil {
+		return "", err
+	}
+
+	var result struct {
+		Contents []struct {
+			URI      string `json:"uri"`
+			MimeType string `json:"mimeType,omitempty"`
+			Text     string `json:"text,omitempty"`
+			Blob     string `json:"blob,omitempty"`
+		} `json:"contents"`
+	}
+	if err := json.Unmarshal(resp.Result, &result); err != nil {
+		return "", fmt.Errorf("failed to parse resource: %w", err)
+	}
+
+	var texts []string
+	for _, c := range result.Contents {
+		if c.Text != "" {
+			texts = append(texts, c.Text)
+		}
+	}
+	return strings.Join(texts, "\n"), nil
+}
+
+// ListPrompts requests the list of available prompts.
+func (c *Client) ListPrompts(ctx context.Context) ([]Prompt, error) {
+	resp, err := c.call("prompts/list", nil)
+	if err != nil {
+		return nil, err
+	}
+
+	var result struct {
+		Prompts []Prompt `json:"prompts"`
+	}
+	if err := json.Unmarshal(resp.Result, &result); err != nil {
+		return nil, err
+	}
+	c.prompts = result.Prompts
+	return result.Prompts, nil
+}
+
+// GetPrompt retrieves a specific prompt template.
+func (c *Client) GetPrompt(ctx context.Context, name string, args map[string]string) ([]PromptMessage, error) {
+	params := map[string]interface{}{
+		"name":     name,
+		"arguments": args,
+	}
+
+	resp, err := c.call("prompts/get", params)
+	if err != nil {
+		return nil, err
+	}
+
+	var result struct {
+		Description string          `json:"description,omitempty"`
+		Messages    []PromptMessage `json:"messages"`
+	}
+	if err := json.Unmarshal(resp.Result, &result); err != nil {
+		return nil, fmt.Errorf("failed to parse prompt: %w", err)
+	}
+
+	return result.Messages, nil
+}
+
 // Tools returns the cached tool list.
 func (c *Client) Tools() []Tool {
 	return c.tools
+}
+
+// Resources returns the cached resource list.
+func (c *Client) Resources() []Resource {
+	return c.resources
+}
+
+// Prompts returns the cached prompt list.
+func (c *Client) Prompts() []Prompt {
+	return c.prompts
 }
 
 // ServerInfo returns the server metadata.
@@ -232,6 +340,66 @@ func (c *Client) Close() error {
 	c.notify("shutdown", nil)
 	c.stdin.Close()
 	return c.cmd.Wait()
+}
+
+// SetTimeout sets the request timeout for RPC calls.
+func (c *Client) SetTimeout(d time.Duration) {
+	c.timeout = d
+}
+
+// writeMessage sends a JSON-RPC message with Content-Length framing.
+// Format: Content-Length: <N>\r\n\r\n<json>
+func (c *Client) writeMessage(data []byte) error {
+	c.writeMu.Lock()
+	defer c.writeMu.Unlock()
+
+	header := fmt.Sprintf("Content-Length: %d\r\n\r\n", len(data))
+	if _, err := c.stdin.Write([]byte(header)); err != nil {
+		return fmt.Errorf("failed to write header: %w", err)
+	}
+	if _, err := c.stdin.Write(data); err != nil {
+		return fmt.Errorf("failed to write body: %w", err)
+	}
+	return nil
+}
+
+// readMessage reads a JSON-RPC message with Content-Length framing.
+func (c *Client) readMessage() ([]byte, error) {
+	// Read headers until empty line
+	var contentLength int
+	for {
+		line, err := c.stdout.ReadString('\n')
+		if err != nil {
+			return nil, err
+		}
+		line = strings.TrimRight(line, "\r\n")
+
+		// Empty line marks end of headers
+		if line == "" {
+			break
+		}
+
+		// Parse Content-Length header
+		if strings.HasPrefix(line, "Content-Length:") {
+			val := strings.TrimSpace(strings.TrimPrefix(line, "Content-Length:"))
+			contentLength, err = strconv.Atoi(val)
+			if err != nil {
+				return nil, fmt.Errorf("invalid Content-Length: %s", val)
+			}
+		}
+	}
+
+	if contentLength <= 0 {
+		return nil, fmt.Errorf("missing Content-Length header")
+	}
+
+	// Read the body
+	buf := make([]byte, contentLength)
+	if _, err := io.ReadFull(c.stdout, buf); err != nil {
+		return nil, fmt.Errorf("failed to read message body: %w", err)
+	}
+
+	return buf, nil
 }
 
 func (c *Client) call(method string, params interface{}) (*jsonRPCResponse, error) {
@@ -260,16 +428,20 @@ func (c *Client) call(method string, params interface{}) (*jsonRPCResponse, erro
 		return nil, err
 	}
 
-	if _, err := fmt.Fprintf(c.stdin, "%s\n", data); err != nil {
+	if err := c.writeMessage(data); err != nil {
 		return nil, fmt.Errorf("failed to send request: %w", err)
 	}
 
-	resp := <-ch
-	if resp.Error != nil {
-		return nil, fmt.Errorf("RPC error %d: %s", resp.Error.Code, resp.Error.Message)
+	// Wait for response with timeout
+	select {
+	case resp := <-ch:
+		if resp.Error != nil {
+			return nil, fmt.Errorf("RPC error %d: %s", resp.Error.Code, resp.Error.Message)
+		}
+		return &resp, nil
+	case <-time.After(c.timeout):
+		return nil, fmt.Errorf("request timeout after %s for method %s", c.timeout, method)
 	}
-
-	return &resp, nil
 }
 
 func (c *Client) notify(method string, params interface{}) {
@@ -280,18 +452,18 @@ func (c *Client) notify(method string, params interface{}) {
 	}
 
 	data, _ := json.Marshal(req)
-	fmt.Fprintf(c.stdin, "%s\n", data)
+	c.writeMessage(data)
 }
 
 func (c *Client) readLoop() {
 	for {
-		line, err := c.stdout.ReadBytes('\n')
+		msg, err := c.readMessage()
 		if err != nil {
 			return
 		}
 
 		var resp jsonRPCResponse
-		if err := json.Unmarshal(line, &resp); err != nil {
+		if err := json.Unmarshal(msg, &resp); err != nil {
 			continue
 		}
 
@@ -302,5 +474,6 @@ func (c *Client) readLoop() {
 			}
 			c.mu.Unlock()
 		}
+		// Notifications (no ID) are silently discarded for now
 	}
 }

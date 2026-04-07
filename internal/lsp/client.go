@@ -112,16 +112,27 @@ type CompletionItem struct {
 	InsertText    string `json:"insertText,omitempty"`
 }
 
+// LocationLink represents an LSP LocationLink (link target with spans).
+type LocationLink struct {
+	OriginSelectionRange *Range `json:"originSelectionRange"`
+	TargetUri            string `json:"targetUri"`
+	TargetRange          Range  `json:"targetRange"`
+	TargetSelectionRange Range  `json:"targetSelectionRange"`
+}
+
 // Client is an LSP client that communicates over stdio JSON-RPC.
 type Client struct {
-	cmd       *exec.Cmd
-	stdin     io.WriteCloser
-	stdout    *bufio.Reader
-	idCounter atomic.Int64
-	pending   map[int64]chan jsonRPCResponse
-	mu        sync.Mutex
-	caps      ServerCapabilities
+	cmd        *exec.Cmd
+	stdin      io.WriteCloser
+	stdout     *bufio.Reader
+	idCounter  atomic.Int64
+	pending    map[int64]chan jsonRPCResponse
+	mu         sync.Mutex
+	caps       ServerCapabilities
 	serverInfo ServerInfo
+
+	diagnostics map[string][]Diagnostic
+	diagMu      sync.Mutex
 }
 
 // NewClient starts an LSP server and creates a client.
@@ -146,10 +157,11 @@ func NewClient(ctx context.Context, command string, args []string) (*Client, err
 	}
 
 	client := &Client{
-		cmd:     cmd,
-		stdin:   stdin,
-		stdout:  bufio.NewReaderSize(stdout, 1024*1024),
-		pending: make(map[int64]chan jsonRPCResponse),
+		cmd:         cmd,
+		stdin:       stdin,
+		stdout:      bufio.NewReaderSize(stdout, 1024*1024),
+		pending:     make(map[int64]chan jsonRPCResponse),
+		diagnostics: make(map[string][]Diagnostic),
 	}
 
 	go client.readLoop()
@@ -230,10 +242,38 @@ func (c *Client) Definition(ctx context.Context, uri string, line, character int
 		return nil, err
 	}
 
-	// Can be Location or []Location
+	// Can be Location, []Location, LocationLink, or []LocationLink.
+	// Try LocationLink first (detected by presence of "targetUri" field).
 	var locations []Location
+
+	// Check if the result contains LocationLink objects (have "targetUri").
+	raw := resp.Result
+	if len(raw) > 0 {
+		// Try as []LocationLink
+		var links []LocationLink
+		if err := json.Unmarshal(raw, &links); err == nil && len(links) > 0 && links[0].TargetUri != "" {
+			for _, ll := range links {
+				locations = append(locations, Location{
+					URI:   ll.TargetUri,
+					Range: ll.TargetSelectionRange,
+				})
+			}
+			return locations, nil
+		}
+
+		// Try as single LocationLink
+		var link LocationLink
+		if err := json.Unmarshal(raw, &link); err == nil && link.TargetUri != "" {
+			return []Location{{
+				URI:   link.TargetUri,
+				Range: link.TargetSelectionRange,
+			}}, nil
+		}
+	}
+
+	// Try as []Location
 	if err := json.Unmarshal(resp.Result, &locations); err != nil {
-		// Try single location
+		// Try single Location
 		var loc Location
 		if err := json.Unmarshal(resp.Result, &loc); err != nil {
 			return nil, err
@@ -366,6 +406,41 @@ func (c *Client) readLoop() {
 				ch <- resp
 			}
 			c.mu.Unlock()
+		} else {
+			// Handle notifications
+			var notif struct {
+				Method string          `json:"method"`
+				Params json.RawMessage `json:"params"`
+			}
+			if err := json.Unmarshal(body, &notif); err == nil && notif.Method == "textDocument/publishDiagnostics" {
+				var params struct {
+					URI         string       `json:"uri"`
+					Diagnostics []Diagnostic `json:"diagnostics"`
+				}
+				if err := json.Unmarshal(notif.Params, &params); err == nil {
+					c.diagMu.Lock()
+					c.diagnostics[params.URI] = params.Diagnostics
+					c.diagMu.Unlock()
+				}
+			}
 		}
 	}
+}
+
+// GetDiagnostics returns the stored diagnostics for a given URI.
+func (c *Client) GetDiagnostics(uri string) []Diagnostic {
+	c.diagMu.Lock()
+	defer c.diagMu.Unlock()
+	return c.diagnostics[uri]
+}
+
+// AllDiagnostics returns all stored diagnostics keyed by URI.
+func (c *Client) AllDiagnostics() map[string][]Diagnostic {
+	c.diagMu.Lock()
+	defer c.diagMu.Unlock()
+	out := make(map[string][]Diagnostic, len(c.diagnostics))
+	for k, v := range c.diagnostics {
+		out[k] = v
+	}
+	return out
 }

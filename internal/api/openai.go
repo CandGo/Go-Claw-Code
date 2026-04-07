@@ -4,13 +4,22 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"fmt"
 	"io"
 	"net/http"
+	"os"
+	"strconv"
 	"strings"
 	"time"
 )
 
+const (
+	xAIDefaultBaseURL    = "https://api.x.ai/v1"
+	openidDefaultBaseURL = "https://api.openai.com/v1"
+)
+
 // OpenAICompatClient implements Provider for OpenAI-compatible APIs.
+// Mirrors Rust OpenAiCompatClient.
 type OpenAICompatClient struct {
 	baseURL    string
 	auth       *AuthSource
@@ -19,7 +28,11 @@ type OpenAICompatClient struct {
 	retry      RetryPolicy
 }
 
+// NewOpenAICompatClient creates a new OpenAI-compatible client.
 func NewOpenAICompatClient(baseURL string, auth *AuthSource, model string) *OpenAICompatClient {
+	if baseURL == "" {
+		baseURL = openidDefaultBaseURL
+	}
 	return &OpenAICompatClient{
 		baseURL: strings.TrimRight(baseURL, "/"),
 		auth:    auth,
@@ -27,15 +40,38 @@ func NewOpenAICompatClient(baseURL string, auth *AuthSource, model string) *Open
 		httpClient: &http.Client{
 			Timeout: 5 * time.Minute,
 		},
-		retry: DefaultRetryPolicy(),
+		retry: RetryPolicy{
+			MaxAttempts: defaultMaxRetries + 1,
+			BaseDelay:   defaultInitialBackoff,
+			MaxDelay:    defaultMaxBackoff,
+		},
 	}
 }
 
+// NewXAICompatClient creates a client configured for xAI.
+// Mirrors Rust OpenAiCompatConfig::xai().
+func NewXAICompatClient(auth *AuthSource, model string) *OpenAICompatClient {
+	apiKey := auth.APIKey
+	if apiKey == "" {
+		apiKey = auth.BearerToken
+	}
+	return NewOpenAICompatClient(xAIDefaultBaseURL, &AuthSource{APIKey: apiKey}, model)
+}
+
+// WithRetryPolicy sets a custom retry policy.
+func (c *OpenAICompatClient) WithRetryPolicy(policy RetryPolicy) *OpenAICompatClient {
+	c.retry = policy
+	return c
+}
+
+// --- OpenAI wire types (mirrors Rust serde types) ---
+
 // oaiChatMessage is the OpenAI chat completion message format.
 type oaiChatMessage struct {
-	Role      string         `json:"role"`
-	Content   interface{}    `json:"content"` // string or []oaiContentPart
-	ToolCalls []oaiToolCall  `json:"tool_calls,omitempty"`
+	Role       string        `json:"role"`
+	Content    interface{}   `json:"content"`                // string or []oaiContentPart or nil
+	ToolCalls  []oaiToolCall `json:"tool_calls,omitempty"`
+	ToolCallID string        `json:"tool_call_id,omitempty"` // for role=tool messages
 }
 
 type oaiContentPart struct {
@@ -56,12 +92,12 @@ type oaiFunctionCall struct {
 }
 
 type oaiChatRequest struct {
-	Model       string           `json:"model"`
-	Messages    []oaiChatMessage `json:"messages"`
-	MaxTokens   int              `json:"max_tokens,omitempty"`
-	Stream      bool             `json:"stream"`
-	Tools       []oaiToolDef     `json:"tools,omitempty"`
-	ToolChoice  interface{}      `json:"tool_choice,omitempty"`
+	Model      string           `json:"model"`
+	Messages   []oaiChatMessage `json:"messages"`
+	MaxTokens  int              `json:"max_tokens,omitempty"`
+	Stream     bool             `json:"stream"`
+	Tools      []oaiToolDef     `json:"tools,omitempty"`
+	ToolChoice interface{}      `json:"tool_choice,omitempty"`
 }
 
 type oaiToolDef struct {
@@ -76,12 +112,13 @@ type oaiFunction struct {
 }
 
 type oaiChatResponse struct {
-	ID      string         `json:"id"`
-	Choices []oaiChoice    `json:"choices"`
-	Usage   oaiUsage       `json:"usage"`
+	ID      string      `json:"id"`
+	Choices []oaiChoice `json:"choices"`
+	Usage   oaiUsage    `json:"usage"`
 }
 
 type oaiChoice struct {
+	Index        int            `json:"index"`
 	Message      oaiChatMessage `json:"message"`
 	FinishReason string         `json:"finish_reason"`
 }
@@ -92,7 +129,10 @@ type oaiUsage struct {
 	TotalTokens      int `json:"total_tokens"`
 }
 
+// --- Request translation (mirrors Rust build_chat_completion_request) ---
+
 // translateToOpenAI converts an Anthropic-format request to OpenAI format.
+// Mirrors Rust translate_message + build_chat_completion_request.
 func translateToOpenAI(req *MessageRequest) *oaiChatRequest {
 	oai := &oaiChatRequest{
 		Model:     req.Model,
@@ -121,19 +161,12 @@ func translateToOpenAI(req *MessageRequest) *oaiChatRequest {
 					parts = append(parts, oaiContentPart{Type: "text", Text: block.Text})
 				case "tool_result":
 					// OpenAI uses role=tool with tool_call_id
-					var contentStr string
-					if len(block.Content) > 0 {
-						raw, _ := json.Marshal(block.Content)
-						contentStr = string(raw)
-					}
-					// Emit as a separate tool result message
+					contentStr := flattenToolResultContent(block)
 					oai.Messages = append(oai.Messages, oaiChatMessage{
-						Role:    "tool",
-						Content: contentStr,
+						Role:       "tool",
+						Content:    contentStr,
+						ToolCallID: block.ToolUseID,
 					})
-					// Store tool_call_id for proper mapping
-					// We need to set tool_call_id, but Go JSON needs special handling
-					// For now we emit it as a tool message
 					continue
 				default:
 					raw, _ := json.Marshal(block)
@@ -193,7 +226,7 @@ func translateToOpenAI(req *MessageRequest) *oaiChatRequest {
 		})
 	}
 
-	// Tool choice
+	// Tool choice (mirrors Rust openai_tool_choice)
 	if req.ToolChoice.Type == "auto" {
 		oai.ToolChoice = "auto"
 	} else if req.ToolChoice.Type == "any" {
@@ -208,30 +241,52 @@ func translateToOpenAI(req *MessageRequest) *oaiChatRequest {
 	return oai
 }
 
-func (c *OpenAICompatClient) buildRequest(ctx context.Context, oai *oaiChatRequest) (*http.Request, error) {
+// flattenToolResultContent extracts text from a tool_result content block.
+func flattenToolResultContent(block InputContentBlock) string {
+	if len(block.Content) == 0 {
+		return block.Text
+	}
+	var parts []string
+	for _, c := range block.Content {
+		if c.Text != "" {
+			parts = append(parts, c.Text)
+		} else if c.Value != nil {
+			raw, _ := json.Marshal(c.Value)
+			parts = append(parts, string(raw))
+		}
+	}
+	result := strings.Join(parts, "\n")
+	if result == "" {
+		raw, _ := json.Marshal(block.Content)
+		return string(raw)
+	}
+	return result
+}
+
+// buildHTTPRequest constructs an HTTP request for the OpenAI chat completions API.
+func (c *OpenAICompatClient) buildHTTPRequest(ctx context.Context, oai *oaiChatRequest) (*http.Request, error) {
 	body, err := json.Marshal(oai)
 	if err != nil {
-		return nil, JsonError(err)
+		return nil, NewJsonError(err)
 	}
 
-	url := c.baseURL + "/v1/chat/completions"
-	httpReq, err := http.NewRequestWithContext(ctx, "POST", url, bytes.NewReader(body))
+	endpoint := c.baseURL + "/chat/completions"
+	httpReq, err := http.NewRequestWithContext(ctx, "POST", endpoint, bytes.NewReader(body))
 	if err != nil {
-		return nil, JsonError(err)
+		return nil, NewIoError(err)
 	}
 
 	httpReq.Header.Set("Content-Type", "application/json")
 	if c.auth.APIKey != "" {
 		httpReq.Header.Set("Authorization", "Bearer "+c.auth.APIKey)
-	}
-	if c.auth.BearerToken != "" {
+	} else if c.auth.BearerToken != "" {
 		httpReq.Header.Set("Authorization", "Bearer "+c.auth.BearerToken)
 	}
 
 	return httpReq, nil
 }
 
-// SendMessage sends a non-streaming request via OpenAI-compatible API.
+// SendMessage sends a non-streaming request via OpenAI-compatible API with retry.
 func (c *OpenAICompatClient) SendMessage(ctx context.Context, req *MessageRequest) (*MessageResponse, error) {
 	req.Stream = false
 	req.Model = c.model
@@ -244,10 +299,15 @@ func (c *OpenAICompatClient) SendMessage(ctx context.Context, req *MessageReques
 	var lastErr error
 	for attempt := 0; attempt < c.retry.MaxAttempts; attempt++ {
 		if attempt > 0 {
-			time.Sleep(c.retry.Delay(attempt - 1))
+			delay := c.retry.Delay(attempt - 1)
+			select {
+			case <-ctx.Done():
+				return nil, ctx.Err()
+			case <-time.After(delay):
+			}
 		}
 
-		httpReq, err := c.buildRequest(ctx, oai)
+		httpReq, err := c.buildHTTPRequest(ctx, oai)
 		if err != nil {
 			return nil, err
 		}
@@ -255,25 +315,40 @@ func (c *OpenAICompatClient) SendMessage(ctx context.Context, req *MessageReques
 		resp, err := c.httpClient.Do(httpReq)
 		if err != nil {
 			lastErr = err
-			if isRetryable(err) {
+			if attempt < c.retry.MaxAttempts-1 {
 				continue
 			}
-			return nil, &ApiError{Code: "connection_error", Message: err.Error()}
+			return nil, RetriesExhausted(c.retry.MaxAttempts, lastErr)
 		}
-		defer resp.Body.Close()
 
-		respBody, _ := io.ReadAll(resp.Body)
+		respBody, err := io.ReadAll(resp.Body)
+		resp.Body.Close()
+		if err != nil {
+			return nil, NewIoError(err)
+		}
+
 		if resp.StatusCode != 200 {
-			lastErr = HttpError(resp.StatusCode, string(respBody))
-			if isRetryableStatus(resp.StatusCode) {
+			lastErr = parseApiError(resp.StatusCode, respBody)
+			if isRetryableStatus(resp.StatusCode) && attempt < c.retry.MaxAttempts-1 {
+				if resp.StatusCode == 429 {
+					if ra := resp.Header.Get("Retry-After"); ra != "" {
+						if secs, err := strconv.Atoi(ra); err == nil && secs > 0 {
+							select {
+							case <-ctx.Done():
+								return nil, ctx.Err()
+							case <-time.After(time.Duration(secs) * time.Second):
+							}
+						}
+					}
+				}
 				continue
 			}
-			return nil, lastErr.(*ApiError)
+			return nil, lastErr
 		}
 
 		var oaiResp oaiChatResponse
 		if err := json.Unmarshal(respBody, &oaiResp); err != nil {
-			return nil, JsonError(err)
+			return nil, NewJsonError(err)
 		}
 
 		return translateResponse(&oaiResp), nil
@@ -282,8 +357,7 @@ func (c *OpenAICompatClient) SendMessage(ctx context.Context, req *MessageReques
 	return nil, RetriesExhausted(c.retry.MaxAttempts, lastErr)
 }
 
-// StreamMessage sends a streaming request via OpenAI-compatible API.
-// Returns Anthropic-format SSEFrames by translating OpenAI's streaming format.
+// StreamMessage sends a streaming request via OpenAI-compatible API with retry.
 func (c *OpenAICompatClient) StreamMessage(ctx context.Context, req *MessageRequest) (<-chan SSEFrame, error) {
 	req.Stream = true
 	req.Model = c.model
@@ -293,26 +367,73 @@ func (c *OpenAICompatClient) StreamMessage(ctx context.Context, req *MessageRequ
 
 	oai := translateToOpenAI(req)
 
-	httpReq, err := c.buildRequest(ctx, oai)
-	if err != nil {
-		return nil, err
+	var lastErr error
+	for attempt := 0; attempt < c.retry.MaxAttempts; attempt++ {
+		if attempt > 0 {
+			delay := c.retry.Delay(attempt - 1)
+			select {
+			case <-ctx.Done():
+				return nil, ctx.Err()
+			case <-time.After(delay):
+			}
+		}
+
+		httpReq, err := c.buildHTTPRequest(ctx, oai)
+		if err != nil {
+			return nil, err
+		}
+
+		resp, err := c.httpClient.Do(httpReq)
+		if err != nil {
+			lastErr = err
+			continue
+		}
+
+		// Handle non-200 status codes (429 rate limit, 500, 401, etc.)
+		if resp.StatusCode != 200 {
+			respBody, _ := io.ReadAll(resp.Body)
+			resp.Body.Close()
+			lastErr = parseApiError(resp.StatusCode, respBody)
+			if isRetryableStatus(resp.StatusCode) && attempt < c.retry.MaxAttempts-1 {
+				if resp.StatusCode == 429 {
+					if ra := resp.Header.Get("Retry-After"); ra != "" {
+						if secs, err := strconv.Atoi(ra); err == nil && secs > 0 {
+							select {
+							case <-ctx.Done():
+								return nil, ctx.Err()
+							case <-time.After(time.Duration(secs) * time.Second):
+							}
+						}
+					}
+				}
+				continue
+			}
+			return nil, lastErr
+		}
+
+		// Handle HTTP 200 with non-SSE body (some providers return JSON errors this way)
+		contentType := resp.Header.Get("Content-Type")
+		if !strings.Contains(contentType, "text/event-stream") {
+			body, _ := io.ReadAll(resp.Body)
+			resp.Body.Close()
+			bodyStr := string(body)
+			if len(bodyStr) > 500 {
+				bodyStr = bodyStr[:500]
+			}
+			if strings.Contains(bodyStr, "error") || (strings.Contains(bodyStr, "\"code\"") && strings.Contains(bodyStr, "\"msg\"")) {
+				return nil, fmt.Errorf("API error: %s", bodyStr)
+			}
+			return nil, fmt.Errorf("unexpected Content-Type %s for streaming response", contentType)
+		}
+
+		ch := translateOpenAIStream(resp.Body)
+		return ch, nil
 	}
 
-	resp, err := c.httpClient.Do(httpReq)
-	if err != nil {
-		return nil, &ApiError{Code: "connection_error", Message: err.Error()}
-	}
-
-	if resp.StatusCode != 200 {
-		body, _ := io.ReadAll(resp.Body)
-		resp.Body.Close()
-		return nil, HttpError(resp.StatusCode, string(body))
-	}
-
-	// Use the OpenAI stream translator to convert to Anthropic format
-	ch := translateOpenAIStream(resp.Body)
-	return ch, nil
+	return nil, RetriesExhausted(c.retry.MaxAttempts, lastErr)
 }
+
+// --- Response normalization ---
 
 // translateResponse converts an OpenAI response to Anthropic format.
 func translateResponse(oai *oaiChatResponse) *MessageResponse {
@@ -328,15 +449,12 @@ func translateResponse(oai *oaiChatResponse) *MessageResponse {
 	}
 
 	for _, choice := range oai.Choices {
-		// Text content
 		if msg, ok := choice.Message.Content.(string); ok && msg != "" {
 			resp.Content = append(resp.Content, OutputContentBlock{Type: "text", Text: msg})
 		}
 
-		// Tool calls -> tool_use content blocks
 		for _, tc := range choice.Message.ToolCalls {
-			var input map[string]interface{}
-			json.Unmarshal([]byte(tc.Function.Arguments), &input)
+			input := parseToolArguments(tc.Function.Arguments)
 			resp.Content = append(resp.Content, OutputContentBlock{
 				Type:  "tool_use",
 				ID:    tc.ID,
@@ -344,7 +462,86 @@ func translateResponse(oai *oaiChatResponse) *MessageResponse {
 				Input: input,
 			})
 		}
+
+		if choice.FinishReason != "" {
+			switch choice.FinishReason {
+			case "tool_calls":
+				resp.StopReason = "tool_use"
+			case "stop":
+				resp.StopReason = "end_turn"
+			default:
+				resp.StopReason = choice.FinishReason
+			}
+		}
 	}
 
 	return resp
+}
+
+// parseToolArguments parses tool call arguments with fallback.
+func parseToolArguments(args string) map[string]interface{} {
+	if args == "" {
+		return map[string]interface{}{}
+	}
+	var input map[string]interface{}
+	if err := json.Unmarshal([]byte(args), &input); err != nil {
+		return map[string]interface{}{"raw": args}
+	}
+	return input
+}
+
+// endpointBuilder builds the API endpoint URL.
+func endpointBuilder(baseURL, path string) string {
+	base := strings.TrimRight(baseURL, "/")
+	if !strings.Contains(base, "/v1") {
+		base += "/v1"
+	}
+	return base + path
+}
+
+// DetectOpenAIBaseURL returns the base URL from environment or default.
+func DetectOpenAIBaseURL(provider ProviderKind) string {
+	switch provider {
+	case ProviderXAI:
+		if u := envOr("XAI_BASE_URL", ""); u != "" {
+			return u
+		}
+		return xAIDefaultBaseURL
+	case ProviderOpenAI:
+		if u := envOr("OPENAI_BASE_URL", ""); u != "" {
+			return u
+		}
+		return openidDefaultBaseURL
+	default:
+		if u := envOr("OPENAI_BASE_URL", ""); u != "" {
+			return u
+		}
+		return openidDefaultBaseURL
+	}
+}
+
+// DetectOpenAICredentials resolves credentials for OpenAI-compatible APIs.
+func DetectOpenAICredentials(provider ProviderKind) *AuthSource {
+	switch provider {
+	case ProviderXAI:
+		if key := envOr("XAI_API_KEY", ""); key != "" {
+			return &AuthSource{APIKey: key}
+		}
+	case ProviderOpenAI:
+		if key := envOr("OPENAI_API_KEY", ""); key != "" {
+			return &AuthSource{APIKey: key}
+		}
+	default:
+		if key := envOr("OPENAI_API_KEY", ""); key != "" {
+			return &AuthSource{APIKey: key}
+		}
+	}
+	return nil
+}
+
+func envOr(key, def string) string {
+	if v := strings.TrimSpace(os.Getenv(key)); v != "" {
+		return v
+	}
+	return def
 }

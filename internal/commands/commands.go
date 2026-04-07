@@ -9,6 +9,7 @@ import (
 	"strings"
 	"time"
 
+	clawauth "github.com/go-claw/claw/internal/auth"
 	"github.com/go-claw/claw/internal/plugins"
 	"github.com/go-claw/claw/internal/runtime"
 	"github.com/go-claw/claw/internal/tools"
@@ -19,6 +20,13 @@ var Version = "0.4.0"
 
 // debugToolCallEnabled tracks the debug-tool-call toggle state.
 var debugToolCallEnabled bool
+
+// InternalPromptRunner is set by main to allow slash commands to invoke the AI.
+var InternalPromptRunner func(prompt string, enableTools bool) (string, error)
+
+// InternalPromptRunnerWithProgress is set by main to allow slash commands to
+// invoke the AI with a progress label.
+var InternalPromptRunnerWithProgress func(prompt string, enableTools bool, label string) (string, error)
 
 // globalUsageTracker is set by main to enable /cost.
 var globalUsageTracker *runtime.UsageTracker
@@ -52,6 +60,7 @@ func Commands() []CommandSpec {
 		{Name: "config", Summary: "Show or edit configuration", Args: "[env|hooks|model|plugins]", ResumeMode: true, Handler: cmdConfig},
 		{Name: "memory", Summary: "Show or manage memory", ResumeMode: true, Handler: cmdMemory},
 		{Name: "init", Summary: "Initialize project configuration", Handler: cmdInit},
+		{Name: "setup", Summary: "Re-run first-run setup wizard (API key, model, etc.)", ResumeMode: true, Handler: cmdSetup},
 		{Name: "diff", Summary: "Show uncommitted changes", Handler: cmdDiff},
 		{Name: "version", Summary: "Show version info", ResumeMode: true, Handler: cmdVersion},
 		{Name: "commit", Summary: "Generate a commit message and create a git commit", Handler: cmdCommit},
@@ -70,6 +79,15 @@ func Commands() []CommandSpec {
 		{Name: "commit-push-pr", Summary: "Commit, push, and create a PR", Args: "[context]", Handler: cmdCommitPushPR},
 		{Name: "ultraplan", Summary: "Deep planning with multi-step reasoning", Args: "[task]", Handler: cmdUltraplan},
 		{Name: "teleport", Summary: "Jump to a file or symbol by searching the workspace", Args: "<query>", Handler: cmdTeleport},
+		{Name: "fast", Summary: "Toggle fast model (cycle opus -> sonnet -> haiku)", ResumeMode: true, Handler: cmdFast},
+		{Name: "undo", Summary: "Undo the last change or revert a commit", ResumeMode: true, Handler: cmdUndo},
+		{Name: "doctor", Summary: "Run diagnostics and check environment", ResumeMode: true, Handler: cmdDoctor},
+		{Name: "context", Summary: "Show context window usage", ResumeMode: true, Handler: cmdContext},
+		{Name: "review-pr", Summary: "Review a pull request", Args: "[PR number or URL]", Handler: cmdReviewPR},
+		{Name: "vim", Summary: "Toggle vim keybinding mode in input", ResumeMode: true, Handler: cmdVim},
+		{Name: "statusline", Summary: "Configure status line display", ResumeMode: true, Handler: cmdStatusLine},
+		{Name: "grep-tool", Summary: "Search tool definitions by name or keyword", Args: "<query>", ResumeMode: true, Handler: cmdGrepTool},
+		{Name: "mcp", Summary: "Manage MCP server connections", Args: "[list|restart <name>]", ResumeMode: true, Handler: cmdMCP},
 	}
 }
 
@@ -121,7 +139,7 @@ func cmdHelp(args string) (string, error) {
 
 func cmdStatus(args string) (string, error) {
 	var buf strings.Builder
-	fmt.Fprintf(&buf, "Claw Code (Go) v%s\n", Version)
+	fmt.Fprintf(&buf, "Go-Claw-Code v%s\n", Version)
 	if cwd, err := os.Getwd(); err == nil {
 		fmt.Fprintf(&buf, "  Working dir: %s\n", cwd)
 	}
@@ -138,21 +156,31 @@ func cmdStatus(args string) (string, error) {
 	}
 	// Show remote context
 	ctx := runtime.DetectRemoteContext()
-	if ctx.IsRemote {
-		fmt.Fprintf(&buf, "  Remote: %s\n", ctx.SessionType)
+	if ctx.IsRemote() {
+		fmt.Fprintf(&buf, "  Remote: %s\n", ctx.SessionType())
 	}
 	return buf.String(), nil
 }
 
 func cmdCompact(args string) (string, error) {
-	return "Compaction triggered.", nil
+	if globalSessionAccessor != nil {
+		globalSessionAccessor.Clear()
+	}
+	return "Conversation history compacted.", nil
 }
 
 func cmdModel(args string) (string, error) {
 	if args != "" {
+		if globalRuntimeControl != nil {
+			globalRuntimeControl.SetModel(args)
+			return fmt.Sprintf("Model set to: %s", args), nil
+		}
 		return fmt.Sprintf("Model set to: %s", args), nil
 	}
-	current := os.Getenv("ANTHROPIC_MODEL")
+	current := os.Getenv("CLAW_MODEL")
+	if current == "" {
+		current = os.Getenv("ANTHROPIC_MODEL")
+	}
 	if current == "" {
 		current = "(default)"
 	}
@@ -165,6 +193,9 @@ func cmdPermissions(args string) (string, error) {
 		if !validModes[args] {
 			return "", fmt.Errorf("invalid mode %q; valid: read-only, workspace-write, danger-full-access", args)
 		}
+		if globalRuntimeControl != nil {
+			globalRuntimeControl.SetPermissionMode(args)
+		}
 		return fmt.Sprintf("Permission mode set to: %s", args), nil
 	}
 	current := os.Getenv("CLAW_PERMISSION_MODE")
@@ -175,6 +206,10 @@ func cmdPermissions(args string) (string, error) {
 }
 
 func cmdClear(args string) (string, error) {
+	if globalSessionAccessor != nil {
+		globalSessionAccessor.Clear()
+		return "Session cleared.", nil
+	}
 	return "Session cleared.", nil
 }
 
@@ -209,22 +244,31 @@ func cmdResume(args string) (string, error) {
 func cmdConfig(args string) (string, error) {
 	switch args {
 	case "env":
-		return fmt.Sprintf("ANTHROPIC_BASE_URL=%s\nANTHROPIC_API_KEY=%s\nCLAW_PERMISSION_MODE=%s",
+		return fmt.Sprintf("CLAW_BASE_URL=%s\nCLAW_API_KEY=%s\nANTHROPIC_BASE_URL=%s\nANTHROPIC_API_KEY=%s\nCLAW_PERMISSION_MODE=%s",
+			os.Getenv("CLAW_BASE_URL"),
+			maskKey(os.Getenv("CLAW_API_KEY")),
 			os.Getenv("ANTHROPIC_BASE_URL"),
 			maskKey(os.Getenv("ANTHROPIC_API_KEY")),
 			os.Getenv("CLAW_PERMISSION_MODE")), nil
 	case "hooks":
 		return "Hooks are configured in .claw/settings.json under \"hooks\".\nUse /config to view current settings.", nil
 	case "model":
-		model := os.Getenv("ANTHROPIC_MODEL")
+		model := os.Getenv("CLAW_MODEL")
+		if model == "" {
+			model = os.Getenv("ANTHROPIC_MODEL")
+		}
 		if model == "" {
 			model = "(default: claude-sonnet-4-6)"
 		}
 		return fmt.Sprintf("Model: %s", model), nil
 	case "plugins":
-		mgr := plugins.NewManager()
-		mgr.Discover()
-		list := mgr.List()
+		home, _ := os.UserHomeDir()
+		cfg := plugins.NewPluginManagerConfig(home)
+		mgr := plugins.NewManager(cfg)
+		list, err := mgr.ListPlugins()
+		if err != nil {
+			return "", fmt.Errorf("failed to list plugins: %w", err)
+		}
 		if len(list) == 0 {
 			return "No plugins installed.", nil
 		}
@@ -234,7 +278,7 @@ func cmdConfig(args string) (string, error) {
 			if p.Enabled {
 				status = "enabled"
 			}
-			fmt.Fprintf(&buf, "  %s v%s [%s] - %s\n", p.Name, p.Version, status, p.Description)
+			fmt.Fprintf(&buf, "  %s v%s [%s] - %s\n", p.Metadata.Name, p.Metadata.Version, status, p.Metadata.Description)
 		}
 		return buf.String(), nil
 	default:
@@ -246,7 +290,7 @@ func cmdMemory(args string) (string, error) {
 	home, _ := os.UserHomeDir()
 	var sections []string
 
-	for _, dir := range []string{".claue", ".claw"} {
+	for _, dir := range []string{".claw"} {
 		memDir := filepath.Join(dir, "memory")
 		if entries, err := os.ReadDir(memDir); err == nil && len(entries) > 0 {
 			var files []string
@@ -257,7 +301,7 @@ func cmdMemory(args string) (string, error) {
 		}
 	}
 
-	for _, dir := range []string{".claude", ".claw"} {
+	for _, dir := range []string{".go-claw"} {
 		memDir := filepath.Join(home, dir, "memory")
 		if entries, err := os.ReadDir(memDir); err == nil && len(entries) > 0 {
 			var files []string
@@ -297,7 +341,7 @@ func cmdInit(args string) (string, error) {
 		created = append(created, settingsFile)
 	}
 
-	clawMD := "CLAUDE.md"
+	clawMD := "CLAW.md"
 	if _, err := os.Stat(clawMD); err != nil {
 		content := "# Project Instructions\n\nAdd project-specific instructions here.\n"
 		if err := os.WriteFile(clawMD, []byte(content), 0644); err != nil {
@@ -310,6 +354,62 @@ func cmdInit(args string) (string, error) {
 		return "Project already initialized. All files exist.", nil
 	}
 	return "Created:\n  " + strings.Join(created, "\n  "), nil
+}
+
+func cmdSetup(args string) (string, error) {
+	if !clawauth.IsTerminal() {
+		return "", fmt.Errorf("/setup requires an interactive terminal")
+	}
+
+	// Show current config first
+	var buf strings.Builder
+	buf.WriteString("Current configuration:\n")
+	if key := os.Getenv("CLAW_API_KEY"); key != "" {
+		buf.WriteString("  CLAW_API_KEY: " + maskKey(key) + "\n")
+	} else if key := os.Getenv("ANTHROPIC_API_KEY"); key != "" {
+		buf.WriteString("  ANTHROPIC_API_KEY: " + maskKey(key) + " (fallback)\n")
+	} else if clawauth.HasCredentialsFile() {
+		buf.WriteString("  API Key: saved in ~/.go-claw/auth.json\n")
+	} else {
+		buf.WriteString("  API Key: not configured\n")
+	}
+	if u := os.Getenv("CLAW_BASE_URL"); u != "" {
+		buf.WriteString("  CLAW_BASE_URL: " + u + "\n")
+	} else if u := os.Getenv("ANTHROPIC_BASE_URL"); u != "" {
+		buf.WriteString("  ANTHROPIC_BASE_URL: " + u + " (fallback)\n")
+	}
+	if m := os.Getenv("CLAW_MODEL"); m != "" {
+		buf.WriteString("  CLAW_MODEL: " + m + "\n")
+	} else if m := os.Getenv("ANTHROPIC_MODEL"); m != "" {
+		buf.WriteString("  ANTHROPIC_MODEL: " + m + " (fallback)\n")
+	}
+	buf.WriteString("\n")
+
+	// Run the setup wizard
+	result, err := clawauth.RunSetupWizard(Version)
+	if err != nil {
+		return buf.String() + "Setup failed: " + err.Error(), nil
+	}
+	if result == nil {
+		return buf.String() + "Setup skipped.", nil
+	}
+
+	// Apply changes to runtime if possible
+	if globalRuntimeControl != nil {
+		if result.Model != "" {
+			globalRuntimeControl.SetModel(result.Model)
+		}
+	}
+
+	buf.WriteString("Setup complete! ")
+	if result.APIKey != "" {
+		buf.WriteString("Credentials saved to ~/.go-claw/auth.json. ")
+	}
+	if result.OAuthToken {
+		buf.WriteString("OAuth token saved. ")
+	}
+	buf.WriteString("\nNote: restart Go-Claw-Code for all changes to take full effect.")
+	return buf.String(), nil
 }
 
 func cmdDiff(args string) (string, error) {
@@ -330,7 +430,7 @@ func cmdDiff(args string) (string, error) {
 }
 
 func cmdVersion(args string) (string, error) {
-	return fmt.Sprintf("Claw Code (Go) v%s", Version), nil
+	return fmt.Sprintf("Go-Claw-Code v%s", Version), nil
 }
 
 func cmdCommit(args string) (string, error) {
@@ -405,7 +505,7 @@ func cmdExport(args string) (string, error) {
 	sessionDir := ".claw-sessions"
 	data, err := findLatestSession(sessionDir)
 	if err != nil {
-		content := fmt.Sprintf("# Claw Code Export\n\nExported: %s\n\nNo session data found.\n", time.Now().Format(time.RFC3339))
+		content := fmt.Sprintf("# Go-Claw-Code Export\n\nExported: %s\n\nNo session data found.\n", time.Now().Format(time.RFC3339))
 		if err := os.WriteFile(filename, []byte(content), 0644); err != nil {
 			return "", err
 		}
@@ -462,7 +562,7 @@ func cmdAgents(args string) (string, error) {
 func cmdSkills(args string) (string, error) {
 	skills := tools.DiscoverSkills()
 	if len(skills) == 0 {
-		return "No skills found. Create skills in .claw/skills/ or ~/.claw/skills/", nil
+		return "No skills found. Create skills in .claw/skills/ or ~/.go-claw/skills/", nil
 	}
 	return "Available skills:\n  " + strings.Join(skills, "\n  "), nil
 }
@@ -538,15 +638,19 @@ func cmdTodo(args string) (string, error) {
 }
 
 func cmdPlugin(args string) (string, error) {
-	mgr := plugins.NewManager()
-	mgr.Discover()
+	home, _ := os.UserHomeDir()
+	cfg := plugins.NewPluginManagerConfig(filepath.Join(home, ".go-claw"))
+	mgr := plugins.NewManager(cfg)
 	parts := strings.Fields(args)
 
 	switch {
 	case len(parts) == 0 || parts[0] == "list":
-		list := mgr.List()
+		list, err := mgr.ListPlugins()
+		if err != nil {
+			return "", fmt.Errorf("failed to list plugins: %w", err)
+		}
 		if len(list) == 0 {
-			return "No plugins installed. Place plugins in .claw/plugins/ or ~/.claw/plugins/", nil
+			return "No plugins installed. Place plugins in .claw/plugins/ or ~/.go-claw/plugins/", nil
 		}
 		var buf strings.Builder
 		for _, p := range list {
@@ -554,13 +658,12 @@ func cmdPlugin(args string) (string, error) {
 			if p.Enabled {
 				status = "enabled"
 			}
-			tools := len(p.Tools)
-			fmt.Fprintf(&buf, "  %s v%s [%s] tools=%d - %s\n", p.Name, p.Version, status, tools, p.Description)
+			fmt.Fprintf(&buf, "  %s v%s [%s] - %s\n", p.Metadata.Name, p.Metadata.Version, status, p.Metadata.Description)
 		}
 		return buf.String(), nil
 
 	case parts[0] == "install" && len(parts) >= 2:
-		if err := mgr.Install(parts[1]); err != nil {
+		if _, err := mgr.Install(parts[1]); err != nil {
 			return "", fmt.Errorf("install failed: %w", err)
 		}
 		return fmt.Sprintf("Plugin installed from: %s", parts[1]), nil
@@ -601,6 +704,9 @@ func cmdBughunter(args string) (string, error) {
 	scope := args
 	if scope == "" {
 		scope = "."
+	}
+	if InternalPromptRunner != nil {
+		return InternalPromptRunner(fmt.Sprintf("Inspect the codebase at %s for likely bugs. Read files, search for common bug patterns (off-by-one errors, null pointer dereferences, race conditions, unhandled errors, resource leaks), and report your findings.", scope), true)
 	}
 	return fmt.Sprintf("Bughunter: inspecting %s for likely bugs.\nUse tools to read files, search for patterns, and identify potential issues.", scope), nil
 }
@@ -656,7 +762,10 @@ func cmdUltraplan(args string) (string, error) {
 	if task == "" {
 		return "", fmt.Errorf("usage: /ultraplan <task description>")
 	}
-	return fmt.Sprintf("Ultraplan: deep planning for: %s\n(This command works best when connected to an agent runtime)", task), nil
+	if InternalPromptRunner != nil {
+		return InternalPromptRunner(fmt.Sprintf("Create a detailed implementation plan for the following task. Break it down into steps, identify files to modify, consider edge cases, and provide a clear execution order:\n\n%s", task), true)
+	}
+	return fmt.Sprintf("Ultraplan: deep planning for: %s", task), nil
 }
 
 func cmdTeleport(args string) (string, error) {
@@ -697,6 +806,384 @@ func cmdTeleport(args string) (string, error) {
 		return fmt.Sprintf("No matches found for: %s", args), nil
 	}
 	return "Found:\n  " + strings.Join(results, "\n  "), nil
+}
+
+func cmdFast(args string) (string, error) {
+	if globalRuntimeControl == nil {
+		return "", fmt.Errorf("runtime not initialized")
+	}
+	current := strings.ToLower(globalRuntimeControl.Model())
+	switch {
+	case strings.Contains(current, "opus"):
+		globalRuntimeControl.SetModel("claude-sonnet-4-6")
+	case strings.Contains(current, "sonnet"):
+		globalRuntimeControl.SetModel("claude-haiku-4-5")
+	default:
+		globalRuntimeControl.SetModel("claude-sonnet-4-6")
+	}
+	return fmt.Sprintf("Switched to: %s", globalRuntimeControl.Model()), nil
+}
+
+func cmdUndo(args string) (string, error) {
+	// Try git undo first
+	if _, err := exec.Command("git", "rev-parse", "--is-inside-work-tree").CombinedOutput(); err == nil {
+		if args == "--hard" {
+			out, err := exec.Command("git", "reset", "--hard", "HEAD~1").CombinedOutput()
+			return string(out), err
+		}
+		out, err := exec.Command("git", "reset", "--soft", "HEAD~1").CombinedOutput()
+		if err != nil {
+			return string(out), err
+		}
+		return "Undid last commit (soft reset). Changes are staged.\nUse /undo --hard to discard changes entirely.", nil
+	}
+	return "", fmt.Errorf("not in a git repository")
+}
+
+func cmdDoctor(args string) (string, error) {
+	var buf strings.Builder
+	fmt.Fprintf(&buf, "Go-Claw-Code v%s Diagnostics:\n", Version)
+
+	// Check Go version
+	if out, err := exec.Command("go", "version").CombinedOutput(); err == nil {
+		fmt.Fprintf(&buf, "  [OK] Go: %s", strings.TrimSpace(string(out)))
+	} else {
+		buf.WriteString("  [FAIL] Go not found\n")
+	}
+
+	// Check git
+	if out, err := exec.Command("git", "--version").CombinedOutput(); err == nil {
+		fmt.Fprintf(&buf, "  [OK] Git: %s\n", strings.TrimSpace(string(out)))
+	} else {
+		buf.WriteString("  [FAIL] Git not found\n")
+	}
+
+	// Check gh CLI
+	if _, err := exec.LookPath("gh"); err == nil {
+		buf.WriteString("  [OK] GitHub CLI: installed\n")
+	} else {
+		buf.WriteString("  [WARN] GitHub CLI not found (optional)\n")
+	}
+
+	// Check API key
+	apiKey := os.Getenv("CLAW_API_KEY")
+	if apiKey == "" {
+		apiKey = os.Getenv("ANTHROPIC_API_KEY")
+	}
+	if apiKey != "" {
+		fmt.Fprintf(&buf, "  [OK] API Key: %s...%s\n", apiKey[:4], apiKey[len(apiKey)-4:])
+	} else {
+		home, _ := os.UserHomeDir()
+		if _, err := os.Stat(filepath.Join(home, ".go-claw", "auth.json")); err == nil {
+			buf.WriteString("  [OK] API Key: (saved in ~/.go-claw/auth.json)\n")
+		} else {
+			buf.WriteString("  [WARN] No API key set (CLAW_API_KEY or ANTHROPIC_API_KEY)\n")
+		}
+	}
+
+	// Check base URL
+	baseURL := os.Getenv("CLAW_BASE_URL")
+	if baseURL == "" {
+		baseURL = os.Getenv("ANTHROPIC_BASE_URL")
+	}
+	if baseURL != "" {
+		fmt.Fprintf(&buf, "  [INFO] Base URL: %s\n", baseURL)
+	}
+
+	// Check config file
+	if _, err := os.Stat(".claw/settings.json"); err == nil {
+		buf.WriteString("  [OK] Project config: .claw/settings.json\n")
+	} else {
+		buf.WriteString("  [INFO] No project config (use /init to create)\n")
+	}
+
+	// Check CLAW.md
+	if _, err := os.Stat("CLAW.md"); err == nil {
+		buf.WriteString("  [OK] Project instructions: CLAW.md\n")
+	}
+
+	// Check permissions
+	permMode := os.Getenv("CLAW_PERMISSION_MODE")
+	if permMode == "" {
+		permMode = "danger-full-access"
+	}
+	fmt.Fprintf(&buf, "  [INFO] Permission mode: %s\n", permMode)
+
+	return buf.String(), nil
+}
+
+func cmdContext(args string) (string, error) {
+	var buf strings.Builder
+	buf.WriteString("Context:\n")
+
+	// Working directory
+	if cwd, err := os.Getwd(); err == nil {
+		fmt.Fprintf(&buf, "  Working dir: %s\n", cwd)
+	}
+
+	// Git info
+	if out, err := exec.Command("git", "rev-parse", "--abbrev-ref", "HEAD").CombinedOutput(); err == nil {
+		fmt.Fprintf(&buf, "  Branch: %s\n", strings.TrimSpace(string(out)))
+	}
+	if out, err := exec.Command("git", "rev-parse", "--short", "HEAD").CombinedOutput(); err == nil {
+		fmt.Fprintf(&buf, "  Commit: %s\n", strings.TrimSpace(string(out)))
+	}
+	if out, err := exec.Command("git", "status", "--porcelain").CombinedOutput(); err == nil {
+		count := len(strings.Split(strings.TrimSpace(string(out)), "\n"))
+		if string(out) == "" {
+			count = 0
+		}
+		fmt.Fprintf(&buf, "  Uncommitted files: %d\n", count)
+	}
+
+	// Model
+	model := os.Getenv("CLAW_MODEL")
+	if model == "" {
+		model = os.Getenv("ANTHROPIC_MODEL")
+	}
+	if model == "" {
+		model = "(default)"
+	}
+	fmt.Fprintf(&buf, "  Model: %s\n", model)
+
+	// Agents
+	fmt.Fprintf(&buf, "  Agents: %d running\n", len(tools.GetAgents()))
+
+	// Todos
+	fmt.Fprintf(&buf, "  Todos: %d\n", len(tools.GetTodos()))
+
+	// Context window usage
+	if globalUsageTracker != nil {
+		fmt.Fprintf(&buf, "  Usage: %s\n", globalUsageTracker.Summary())
+	}
+
+	// Context files
+	contextFiles := []string{"CLAW.md", ".claw/settings.json", ".claw/memory/MEMORY.md"}
+	for _, f := range contextFiles {
+		if _, err := os.Stat(f); err == nil {
+			fmt.Fprintf(&buf, "  Context file: %s\n", f)
+		}
+	}
+
+	return buf.String(), nil
+}
+
+func cmdReviewPR(args string) (string, error) {
+	if _, err := exec.LookPath("gh"); err != nil {
+		return "", fmt.Errorf("gh CLI not found. Install: https://cli.github.com")
+	}
+	prRef := args
+	if prRef == "" {
+		// Try current branch's PR
+		out, err := exec.Command("gh", "pr", "view", "--json", "number,title,url").CombinedOutput()
+		if err != nil {
+			return "", fmt.Errorf("no PR found for current branch. Use /review-pr <number|URL>")
+		}
+		prRef = strings.TrimSpace(string(out))
+	}
+
+	// Get PR diff
+	out, err := exec.Command("gh", "pr", "diff", prRef).CombinedOutput()
+	if err != nil {
+		return "", fmt.Errorf("failed to get PR diff: %w", err)
+	}
+	if InternalPromptRunner != nil {
+		return InternalPromptRunner(fmt.Sprintf("Review the following pull request diff and provide a structured code review. Identify bugs, suggest improvements, check for security issues, and assess overall code quality:\n\n%s", string(out)), true)
+	}
+	return fmt.Sprintf("PR diff for %s:\n%s", prRef, string(out)), nil
+}
+
+func cmdVim(args string) (string, error) {
+	if globalRuntimeControl == nil {
+		return "", fmt.Errorf("runtime not initialized")
+	}
+	current := globalRuntimeControl.Setting("vim_mode")
+	if current == "true" {
+		globalRuntimeControl.SetSetting("vim_mode", "false")
+		return "Vim mode disabled.", nil
+	}
+	globalRuntimeControl.SetSetting("vim_mode", "true")
+	return "Vim mode enabled. Use hjkl for navigation, i for insert, Esc for normal mode.", nil
+}
+
+func cmdStatusLine(args string) (string, error) {
+	if globalRuntimeControl == nil {
+		return "", fmt.Errorf("runtime not initialized")
+	}
+	switch args {
+	case "show":
+		globalRuntimeControl.SetSetting("statusline_visible", "true")
+		return "Status line visible.", nil
+	case "hide":
+		globalRuntimeControl.SetSetting("statusline_visible", "false")
+		return "Status line hidden.", nil
+	case "":
+		visible := globalRuntimeControl.Setting("statusline_visible")
+		if visible == "" {
+			visible = "true"
+		}
+		return fmt.Sprintf("Status line: %s\nUse /statusline show|hide to toggle.", visible), nil
+	default:
+		return "Usage: /statusline [show|hide]", nil
+	}
+}
+
+func cmdGrepTool(args string) (string, error) {
+	if args == "" {
+		return "Usage: /grep-tool <query>\nSearches tool names and descriptions.", nil
+	}
+	// Delegate to ToolSearch tool
+	if InternalPromptRunner != nil {
+		result, err := InternalPromptRunner(fmt.Sprintf("Use the ToolSearch tool to search for: %s. Show me the matching tools with their names and descriptions.", args), false)
+		if err != nil {
+			return "", err
+		}
+		return result, nil
+	}
+
+	// Fallback: manual search through registered tools
+	var buf strings.Builder
+	for _, cmd := range Commands() {
+		_ = cmd
+	}
+	fmt.Fprintf(&buf, "Search for '%s' in tools.\nUse ToolSearch tool for full search.", args)
+	return buf.String(), nil
+}
+
+func cmdMCP(args string) (string, error) {
+	parts := strings.Fields(args)
+	if len(parts) == 0 || parts[0] == "list" {
+		// Check for MCP config
+		cfgData, err := os.ReadFile(".claw/settings.json")
+		if err != nil {
+			return "No MCP servers configured. Add servers to .claw/settings.json under \"mcpServers\".", nil
+		}
+		var cfg map[string]interface{}
+		if err := json.Unmarshal(cfgData, &cfg); err != nil {
+			return "", fmt.Errorf("failed to parse settings: %w", err)
+		}
+		servers, ok := cfg["mcpServers"].(map[string]interface{})
+		if !ok || len(servers) == 0 {
+			return "No MCP servers configured. Add servers to .claw/settings.json under \"mcpServers\".", nil
+		}
+		var buf strings.Builder
+		buf.WriteString("MCP Servers:\n")
+		for name, srv := range servers {
+			status := "configured"
+			if smap, ok := srv.(map[string]interface{}); ok {
+				if cmd, ok := smap["command"].(string); ok {
+					fmt.Fprintf(&buf, "  %s: %s (%s)\n", name, cmd, status)
+					continue
+				}
+				if url, ok := smap["url"].(string); ok {
+					fmt.Fprintf(&buf, "  %s: %s (%s)\n", name, url, status)
+					continue
+				}
+			}
+			fmt.Fprintf(&buf, "  %s (%s)\n", name, status)
+		}
+		return buf.String(), nil
+	}
+
+	if parts[0] == "restart" && len(parts) >= 2 {
+		return fmt.Sprintf("MCP server restart requested for: %s\nRestart MCP servers by restarting claw.", parts[1]), nil
+	}
+
+	return "Usage: /mcp [list|restart <name>]", nil
+}
+
+// --- RuntimeControl Adapter ---
+
+// RuntimeControlAdapter wraps a ConversationRuntime to expose runtime control
+// methods to slash commands without importing the runtime package directly.
+type RuntimeControlAdapter struct {
+	rt *runtime.ConversationRuntime
+}
+
+// NewRuntimeControlAdapter creates a new adapter around the given runtime.
+func NewRuntimeControlAdapter(rt *runtime.ConversationRuntime) *RuntimeControlAdapter {
+	return &RuntimeControlAdapter{rt: rt}
+}
+
+// PermissionMode returns the current permission mode from the underlying runtime.
+func (a *RuntimeControlAdapter) PermissionMode() string {
+	if a.rt == nil {
+		return ""
+	}
+	return a.rt.PermissionMode()
+}
+
+// SetPermissionMode sets the permission mode on the underlying runtime.
+func (a *RuntimeControlAdapter) SetPermissionMode(mode string) {
+	if a.rt == nil {
+		return
+	}
+	a.rt.SetPermissionMode(mode)
+}
+
+// SetSetting stores a key-value setting in the underlying runtime.
+func (a *RuntimeControlAdapter) SetSetting(key, value string) {
+	if a.rt == nil {
+		return
+	}
+	a.rt.SetSetting(key, value)
+}
+
+// Setting retrieves a setting value from the underlying runtime.
+func (a *RuntimeControlAdapter) Setting(key string) string {
+	if a.rt == nil {
+		return ""
+	}
+	return a.rt.Setting(key)
+}
+
+// Model returns the current model name.
+func (a *RuntimeControlAdapter) Model() string {
+	if a.rt == nil {
+		return ""
+	}
+	return a.rt.Model()
+}
+
+// SetModel changes the model on the underlying runtime.
+func (a *RuntimeControlAdapter) SetModel(m string) {
+	if a.rt == nil {
+		return
+	}
+	a.rt.SetModel(m)
+}
+
+// globalRuntimeControl holds the wired RuntimeControlAdapter for slash commands.
+var globalRuntimeControl *RuntimeControlAdapter
+
+// SetRuntimeControl sets the global runtime control adapter.
+func SetRuntimeControl(adapter *RuntimeControlAdapter) {
+	globalRuntimeControl = adapter
+}
+
+// GetRuntimeControl returns the global runtime control adapter.
+func GetRuntimeControl() *RuntimeControlAdapter {
+	return globalRuntimeControl
+}
+
+// SessionAccessor provides access to session operations for slash commands.
+type SessionAccessor interface {
+	MessageCount() int
+	SaveSession(path string) error
+	Clear()
+}
+
+// globalSessionAccessor holds the wired SessionAccessor.
+var globalSessionAccessor SessionAccessor
+
+// SetSessionAccessor sets the global session accessor.
+func SetSessionAccessor(sa SessionAccessor) {
+	globalSessionAccessor = sa
+}
+
+// GetSessionAccessor returns the global session accessor.
+func GetSessionAccessor() SessionAccessor {
+	return globalSessionAccessor
 }
 
 // --- Helpers ---

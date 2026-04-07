@@ -12,6 +12,11 @@ type KeyMap struct {
 	Clear    key.Binding
 	Newline  key.Binding
 	History  key.Binding
+	VimDown  key.Binding
+	VimUp    key.Binding
+	VimTop   key.Binding
+	VimBottom key.Binding
+	VimInsert key.Binding
 }
 
 // DefaultKeyMap returns the default key bindings.
@@ -39,7 +44,27 @@ func DefaultKeyMap() KeyMap {
 		),
 		History: key.NewBinding(
 			key.WithKeys("up", "down"),
-			key.WithHelp("↑/↓", "history"),
+			key.WithHelp("up/down", "history"),
+		),
+		VimDown: key.NewBinding(
+			key.WithKeys("j"),
+			key.WithHelp("j", "scroll down (vim)"),
+		),
+		VimUp: key.NewBinding(
+			key.WithKeys("k"),
+			key.WithHelp("k", "scroll up (vim)"),
+		),
+		VimTop: key.NewBinding(
+			key.WithKeys("g"),
+			key.WithHelp("g", "scroll to top (vim)"),
+		),
+		VimBottom: key.NewBinding(
+			key.WithKeys("G"),
+			key.WithHelp("G", "scroll to bottom (vim)"),
+		),
+		VimInsert: key.NewBinding(
+			key.WithKeys("i"),
+			key.WithHelp("i", "enter insert mode (vim)"),
 		),
 	}
 }
@@ -55,5 +80,8 @@ func (k KeyMap) FullHelp() [][]key.Binding {
 		{k.Submit, k.Newline},
 		{k.Quit, k.Cancel},
 		{k.Clear, k.History},
+		{k.VimDown, k.VimUp},
+		{k.VimTop, k.VimBottom},
+		{k.VimInsert},
 	}
 }

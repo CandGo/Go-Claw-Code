@@ -1,3 +1,4 @@
+# Binaries
 *.exe
 *.exe~
 *.dll
@@ -5,4 +6,36 @@
 *.dylib
 *.test
 *.out
+go-claw-code
+
+# Build
 go.work
+
+# Temp/debug files
+*.log
+*.json.bak
+claw-request-dump.json
+
+# Sandbox temp dirs
+.sandbox-home/
+.sandbox-tmp/
+
+# Local config (may contain user-specific paths or keys)
+.claw/settings.local.json
+.claw/sessions/
+.go-claw/
+.claw-sessions/
+.claw-agents/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Claude Code local settings
+.claude/settings.local.json
