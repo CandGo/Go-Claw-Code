@@ -266,8 +266,8 @@ func (c *AnthropicClient) buildRequest(ctx context.Context, req *MessageRequest)
 		if c.auth.BearerToken != "" {
 			httpReq.Header.Set("Authorization", "Bearer "+c.auth.BearerToken)
 		} else if c.auth.AWSCreds != nil {
-			signer := NewAWSSigner(c.auth.AWSCreds, c.auth.AWSRegion)
-			signer.SignRequest(httpReq)
+			signer := NewSigV4Signer(c.auth.AWSCreds, c.auth.AWSRegion)
+			signer.Sign(httpReq)
 		}
 	case AuthGoogleADC:
 		if c.auth.GoogleToken != "" {

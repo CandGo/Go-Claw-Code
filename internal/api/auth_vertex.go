@@ -1,5 +1,3 @@
-// Package api provides API client functionality.
-// This file contains Google Vertex AI authentication utilities.
 package api
 
 import (
@@ -8,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -16,379 +15,240 @@ import (
 	"time"
 )
 
-// GoogleCredentials represents Google Cloud credentials.
-type GoogleCredentials struct {
-	AccessToken string    `json:"access_token"`
-	TokenType   string    `json:"token_type"`
-	ExpiresIn   int       `json:"expires_in"`
-	Expiry      time.Time `json:"-"`
+// VertexToken holds a resolved Google Cloud access token.
+type VertexToken struct {
+	AccessToken string
+	TokenType   string
+	ExpiresAt   time.Time
 }
 
-// GoogleAuthManager manages Google Cloud authentication state.
-type GoogleAuthManager struct {
-	mu          sync.RWMutex
-	credentials *GoogleCredentials
-	lastRefresh time.Time
+// vertexProvider resolves Google Cloud credentials for Vertex AI.
+type vertexProvider struct {
+	mu        sync.Mutex
+	cached    *VertexToken
+	fetchedAt time.Time
 }
 
 var (
-	googleAuthManager     *GoogleAuthManager
-	googleAuthManagerOnce sync.Once
+	vertexSingleton     *vertexProvider
+	vertexSingletonOnce sync.Once
 )
 
-// GetGoogleAuthManager returns the singleton Google auth manager.
-func GetGoogleAuthManager() *GoogleAuthManager {
-	googleAuthManagerOnce.Do(func() {
-		googleAuthManager = &GoogleAuthManager{}
+func vertexProviderInstance() *vertexProvider {
+	vertexSingletonOnce.Do(func() {
+		vertexSingleton = &vertexProvider{}
 	})
-	return googleAuthManager
+	return vertexSingleton
 }
 
-// Default TTL for Google credentials (1 hour)
-const defaultGoogleCredentialTTL = 60 * time.Minute
+const vertexTokenTTL = 60 * time.Minute
+const vertexProbeTimeout = 5 * time.Second
 
-// Short timeout for GCP credentials check to avoid metadata server delays
-const gcpCredentialsCheckTimeout = 5 * time.Second
+// A vertexResolver produces a VertexToken or returns an error.
+type vertexResolver func(ctx context.Context) (*VertexToken, error)
 
-// RefreshGCPCredentialsIfNeeded refreshes Google Cloud credentials if needed.
-func (g *GoogleAuthManager) RefreshGCPCredentialsIfNeeded(ctx context.Context) error {
-	g.mu.Lock()
-	defer g.mu.Unlock()
+// token returns a cached token if still valid, otherwise resolves a new one.
+func (vp *vertexProvider) token(ctx context.Context) (*VertexToken, error) {
+	vp.mu.Lock()
+	defer vp.mu.Unlock()
 
-	// Check if credentials are still valid
-	if g.credentials != nil && time.Now().Before(g.credentials.Expiry) {
-		return nil
+	if vp.cached != nil && time.Now().Before(vp.cached.ExpiresAt) {
+		return vp.cached, nil
 	}
 
-	// Try to get credentials from various sources
-	creds, err := g.getCredentials(ctx)
-	if err != nil {
-		return fmt.Errorf("failed to get Google credentials: %w", err)
+	resolvers := []vertexResolver{
+		vp.fromServiceAccountFile,
+		vp.fromGcloudCLI,
+		vp.fromADCFile,
+		vp.fromMetadataServer,
 	}
 
-	g.credentials = creds
-	g.lastRefresh = time.Now()
-	return nil
-}
-
-// GetAccessToken returns the current access token.
-func (g *GoogleAuthManager) GetAccessToken(ctx context.Context) (string, error) {
-	if err := g.RefreshGCPCredentialsIfNeeded(ctx); err != nil {
-		return "", err
-	}
-
-	g.mu.RLock()
-	defer g.mu.RUnlock()
-
-	if g.credentials == nil {
-		return "", fmt.Errorf("no Google credentials available")
-	}
-
-	return g.credentials.AccessToken, nil
-}
-
-// getCredentials attempts to get Google credentials from multiple sources.
-func (g *GoogleAuthManager) getCredentials(ctx context.Context) (*GoogleCredentials, error) {
-	// 1. Check for explicit credentials file
-	if credsFile := os.Getenv("GOOGLE_APPLICATION_CREDENTIALS"); credsFile != "" {
-		creds, err := g.getCredsFromFile(credsFile)
-		if err == nil {
-			return creds, nil
+	for _, resolve := range resolvers {
+		tok, err := resolve(ctx)
+		if err == nil && tok != nil {
+			vp.cached = tok
+			vp.fetchedAt = time.Now()
+			return tok, nil
 		}
 	}
-
-	// 2. Try gcloud CLI credentials
-	creds, err := g.getCredsFromGcloud(ctx)
-	if err == nil && creds != nil {
-		return creds, nil
-	}
-
-	// 3. Try Application Default Credentials (ADC)
-	creds, err = g.getADC(ctx)
-	if err == nil && creds != nil {
-		return creds, nil
-	}
-
-	return nil, fmt.Errorf("no Google credentials found")
+	return nil, fmt.Errorf("no Google Cloud credentials found")
 }
 
-// getCredsFromFile loads credentials from a service account JSON file.
-func (g *GoogleAuthManager) getCredsFromFile(filePath string) (*GoogleCredentials, error) {
-	data, err := os.ReadFile(filePath)
+// fromServiceAccountFile loads a service account key from GOOGLE_APPLICATION_CREDENTIALS.
+func (vp *vertexProvider) fromServiceAccountFile(_ context.Context) (*VertexToken, error) {
+	path := os.Getenv("GOOGLE_APPLICATION_CREDENTIALS")
+	if path == "" {
+		return nil, fmt.Errorf("GOOGLE_APPLICATION_CREDENTIALS not set")
+	}
+
+	data, err := os.ReadFile(path)
 	if err != nil {
-		return nil, fmt.Errorf("failed to read credentials file: %w", err)
+		return nil, err
 	}
 
-	// Check if this is a service account key
-	var serviceAccount struct {
-		Type          string `json:"type"`
-		ProjectID     string `json:"project_id"`
-		PrivateKeyID  string `json:"private_key_id"`
-		PrivateKey    string `json:"private_key"`
-		ClientEmail   string `json:"client_email"`
-		ClientID      string `json:"client_id"`
-		AuthURI       string `json:"auth_uri"`
-		TokenURI      string `json:"token_uri"`
-		AuthProvider  string `json:"auth_provider_x509_cert_url"`
-		ClientCertURL string `json:"client_x509_cert_url"`
+	var sa struct {
+		Type string `json:"type"`
+	}
+	if err := json.Unmarshal(data, &sa); err != nil {
+		return nil, err
+	}
+	if sa.Type != "service_account" {
+		return nil, fmt.Errorf("not a service account key (type=%s)", sa.Type)
 	}
 
-	if err := json.Unmarshal(data, &serviceAccount); err != nil {
-		return nil, fmt.Errorf("failed to parse credentials file: %w", err)
+	// Service account JWT signing requires golang.org/x/oauth2 or similar.
+	// Direct users to gcloud CLI or ADC for now.
+	return nil, fmt.Errorf("service account key detected; use 'gcloud auth application-default login' instead")
+}
+
+// fromGcloudCLI runs gcloud auth print-access-token.
+func (vp *vertexProvider) fromGcloudCLI(ctx context.Context) (*VertexToken, error) {
+	ctx, cancel := context.WithTimeout(ctx, vertexProbeTimeout)
+	defer cancel()
+
+	out, err := exec.CommandContext(ctx, "gcloud", "auth", "print-access-token").Output()
+	if err != nil {
+		return nil, err
+	}
+	tokStr := strings.TrimSpace(string(out))
+	if tokStr == "" {
+		return nil, fmt.Errorf("gcloud returned empty token")
+	}
+	return &VertexToken{
+		AccessToken: tokStr,
+		TokenType:   "Bearer",
+		ExpiresAt:   time.Now().Add(vertexTokenTTL),
+	}, nil
+}
+
+// fromADCFile reads Application Default Credentials from ~/.config/gcloud/.
+func (vp *vertexProvider) fromADCFile(ctx context.Context) (*VertexToken, error) {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return nil, err
+	}
+	adcPath := filepath.Join(home, ".config", "gcloud", "application_default_credentials.json")
+	data, err := os.ReadFile(adcPath)
+	if err != nil {
+		return nil, err
 	}
 
-	if serviceAccount.Type == "service_account" {
-		// For service accounts, we need to use OAuth2 to get an access token
-		// This is a simplified implementation - in production, we'd use golang.org/x/oauth2
-		return g.getServiceAccountToken(serviceAccount)
-	}
-
-	// Check if this is an ADC file
 	var adc struct {
 		Type         string `json:"type"`
 		ClientID     string `json:"client_id"`
 		ClientSecret string `json:"client_secret"`
 		RefreshToken string `json:"refresh_token"`
 	}
-
 	if err := json.Unmarshal(data, &adc); err != nil {
-		return nil, fmt.Errorf("failed to parse ADC file: %w", err)
+		return nil, err
+	}
+	if adc.Type != "authorized_user" || adc.RefreshToken == "" {
+		return nil, fmt.Errorf("ADC file is not an authorized_user credential")
 	}
 
-	if adc.Type == "authorized_user" {
-		return g.getADCToken(adc)
-	}
+	// Exchange refresh token for access token
+	form := url.Values{}
+	form.Set("client_id", adc.ClientID)
+	form.Set("client_secret", adc.ClientSecret)
+	form.Set("refresh_token", adc.RefreshToken)
+	form.Set("grant_type", "refresh_token")
 
-	return nil, fmt.Errorf("unknown credentials format")
-}
-
-// getServiceAccountToken gets an access token using service account credentials.
-// Note: This is a simplified implementation. In production, use golang.org/x/oauth2/google.
-func (g *GoogleAuthManager) getServiceAccountToken(sa struct {
-	Type          string `json:"type"`
-	ProjectID     string `json:"project_id"`
-	PrivateKeyID  string `json:"private_key_id"`
-	PrivateKey    string `json:"private_key"`
-	ClientEmail   string `json:"client_email"`
-	ClientID      string `json:"client_id"`
-	AuthURI       string `json:"auth_uri"`
-	TokenURI      string `json:"token_uri"`
-	AuthProvider  string `json:"auth_provider_x509_cert_url"`
-	ClientCertURL string `json:"client_x509_cert_url"`
-}) (*GoogleCredentials, error) {
-	// This would require JWT signing and OAuth2 flow
-	// For now, we'll fall back to gcloud CLI
-	return nil, fmt.Errorf("service account token generation not implemented, use gcloud auth")
-}
-
-// getADCToken refreshes an ADC token.
-func (g *GoogleAuthManager) getADCToken(adc struct {
-	Type         string `json:"type"`
-	ClientID     string `json:"client_id"`
-	ClientSecret string `json:"client_secret"`
-	RefreshToken string `json:"refresh_token"`
-}) (*GoogleCredentials, error) {
-	// Use Google's OAuth2 endpoint to refresh the token
-	tokenURL := "https://oauth2.googleapis.com/token"
-
-	reqBody := fmt.Sprintf(
-		"client_id=%s&client_secret=%s&refresh_token=%s&grant_type=refresh_token",
-		adc.ClientID, adc.ClientSecret, adc.RefreshToken,
-	)
-
-	resp, err := http.Post(tokenURL, "application/x-www-form-urlencoded", strings.NewReader(reqBody))
+	resp, err := http.Post("https://oauth2.googleapis.com/token",
+		"application/x-www-form-urlencoded", strings.NewReader(form.Encode()))
 	if err != nil {
-		return nil, fmt.Errorf("failed to refresh ADC token: %w", err)
+		return nil, fmt.Errorf("ADC refresh failed: %w", err)
 	}
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("ADC token refresh failed with status %d", resp.StatusCode)
+		return nil, fmt.Errorf("ADC refresh returned HTTP %d", resp.StatusCode)
 	}
 
 	body, err := io.ReadAll(resp.Body)
 	if err != nil {
-		return nil, fmt.Errorf("failed to read ADC response: %w", err)
+		return nil, err
 	}
 
-	var tokenResp struct {
+	var parsed struct {
 		AccessToken string `json:"access_token"`
 		TokenType   string `json:"token_type"`
 		ExpiresIn   int    `json:"expires_in"`
 	}
-
-	if err := json.Unmarshal(body, &tokenResp); err != nil {
-		return nil, fmt.Errorf("failed to parse ADC response: %w", err)
+	if err := json.Unmarshal(body, &parsed); err != nil {
+		return nil, err
 	}
 
-	return &GoogleCredentials{
-		AccessToken: tokenResp.AccessToken,
-		TokenType:   tokenResp.TokenType,
-		ExpiresIn:   tokenResp.ExpiresIn,
-		Expiry:      time.Now().Add(time.Duration(tokenResp.ExpiresIn) * time.Second),
+	return &VertexToken{
+		AccessToken: parsed.AccessToken,
+		TokenType:   parsed.TokenType,
+		ExpiresAt:   time.Now().Add(time.Duration(parsed.ExpiresIn) * time.Second),
 	}, nil
 }
 
-// getCredsFromGcloud gets credentials from gcloud CLI.
-func (g *GoogleAuthManager) getCredsFromGcloud(ctx context.Context) (*GoogleCredentials, error) {
-	ctx, cancel := context.WithTimeout(ctx, gcpCredentialsCheckTimeout)
+// fromMetadataServer probes the GCP metadata server (works inside Compute/Cloud Run/GKE).
+func (vp *vertexProvider) fromMetadataServer(ctx context.Context) (*VertexToken, error) {
+	ctx, cancel := context.WithTimeout(ctx, 2*time.Second)
 	defer cancel()
 
-	// Try gcloud auth print-access-token
-	cmd := exec.CommandContext(ctx, "gcloud", "auth", "print-access-token")
-	output, err := cmd.Output()
+	// Quick connectivity check
+	probeReq, _ := http.NewRequestWithContext(ctx, "GET",
+		"http://metadata.google.internal/computeMetadata/v1/", nil)
+	probeReq.Header.Set("Metadata-Flavor", "Google")
+	probeResp, err := http.DefaultClient.Do(probeReq)
+	if err != nil || probeResp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("not running on GCP")
+	}
+	probeResp.Body.Close()
+
+	// Fetch token
+	tokenURL := "http://metadata.google.internal/computeMetadata/v1/instance/service-accounts/default/token"
+	req, _ := http.NewRequestWithContext(ctx, "GET", tokenURL, nil)
+	req.Header.Set("Metadata-Flavor", "Google")
+
+	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
-		return nil, fmt.Errorf("gcloud auth failed: %w", err)
+		return nil, err
+	}
+	defer resp.Body.Close()
+
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, err
 	}
 
-	token := strings.TrimSpace(string(output))
-	if token == "" {
-		return nil, fmt.Errorf("empty access token from gcloud")
+	var parsed struct {
+		AccessToken string `json:"access_token"`
+		ExpiresIn   int    `json:"expires_in"`
+	}
+	if err := json.Unmarshal(body, &parsed); err != nil {
+		return nil, err
 	}
 
-	// Get the token expiry from gcloud
-	expiryCmd := exec.CommandContext(ctx, "gcloud", "auth", "print-access-token", "--format=json")
-	expiryOutput, err := expiryCmd.Output()
-	if err == nil {
-		var tokenInfo struct {
-			AccessToken struct {
-				ExpireTime string `json:"expireTime"`
-			} `json:"accessToken"`
-		}
-		if err := json.Unmarshal(expiryOutput, &tokenInfo); err == nil {
-			if expiry, err := time.Parse(time.RFC3339, tokenInfo.AccessToken.ExpireTime); err == nil {
-				return &GoogleCredentials{
-					AccessToken: token,
-					TokenType:   "Bearer",
-					Expiry:      expiry,
-				}, nil
-			}
-		}
-	}
-
-	// Default expiry if we can't determine it
-	return &GoogleCredentials{
-		AccessToken: token,
+	return &VertexToken{
+		AccessToken: parsed.AccessToken,
 		TokenType:   "Bearer",
-		Expiry:      time.Now().Add(defaultGoogleCredentialTTL),
+		ExpiresAt:   time.Now().Add(time.Duration(parsed.ExpiresIn) * time.Second),
 	}, nil
 }
 
-// getADC gets Application Default Credentials.
-func (g *GoogleAuthManager) getADC(ctx context.Context) (*GoogleCredentials, error) {
-	// Check for ADC file in standard location
-	home, err := os.UserHomeDir()
+// resolveVertexAuth builds an AuthSource for Google Vertex AI.
+func resolveVertexAuth(ctx context.Context) (*AuthSource, error) {
+	vp := vertexProviderInstance()
+	tok, err := vp.token(ctx)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("vertex: %w", err)
 	}
-
-	adcPath := filepath.Join(home, ".config", "gcloud", "application_default_credentials.json")
-	if _, err := os.Stat(adcPath); err == nil {
-		return g.getCredsFromFile(adcPath)
-	}
-
-	// Try to check if running on GCP (metadata server)
-	if g.isRunningOnGCP(ctx) {
-		return g.getMetadataToken(ctx)
-	}
-
-	return nil, fmt.Errorf("no ADC found")
-}
-
-// isRunningOnGCP checks if running on Google Cloud Platform.
-func (g *GoogleAuthManager) isRunningOnGCP(ctx context.Context) bool {
-	ctx, cancel := context.WithTimeout(ctx, 1*time.Second)
-	defer cancel()
-
-	req, err := http.NewRequestWithContext(ctx, "GET", "http://metadata.google.internal/computeMetadata/v1/", nil)
-	if err != nil {
-		return false
-	}
-	req.Header.Set("Metadata-Flavor", "Google")
-
-	resp, err := http.DefaultClient.Do(req)
-	if err != nil {
-		return false
-	}
-	defer resp.Body.Close()
-
-	return resp.StatusCode == http.StatusOK
-}
-
-// getMetadataToken gets an access token from the GCP metadata server.
-func (g *GoogleAuthManager) getMetadataToken(ctx context.Context) (*GoogleCredentials, error) {
-	ctx, cancel := context.WithTimeout(ctx, gcpCredentialsCheckTimeout)
-	defer cancel()
-
-	metadataURL := "http://metadata.google.internal/computeMetadata/v1/instance/service-accounts/default/token"
-	req, err := http.NewRequestWithContext(ctx, "GET", metadataURL, nil)
-	if err != nil {
-		return nil, err
-	}
-	req.Header.Set("Metadata-Flavor", "Google")
-
-	resp, err := http.DefaultClient.Do(req)
-	if err != nil {
-		return nil, fmt.Errorf("failed to get metadata token: %w", err)
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("metadata server returned status %d", resp.StatusCode)
-	}
-
-	body, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return nil, fmt.Errorf("failed to read metadata response: %w", err)
-	}
-
-	var tokenResp struct {
-		AccessToken string `json:"access_token"`
-		TokenType   string `json:"token_type"`
-		ExpiresIn   int    `json:"expires_in"`
-	}
-
-	if err := json.Unmarshal(body, &tokenResp); err != nil {
-		return nil, fmt.Errorf("failed to parse metadata response: %w", err)
-	}
-
-	return &GoogleCredentials{
-		AccessToken: tokenResp.AccessToken,
-		TokenType:   tokenResp.TokenType,
-		ExpiresIn:   tokenResp.ExpiresIn,
-		Expiry:      time.Now().Add(time.Duration(tokenResp.ExpiresIn) * time.Second),
+	return &AuthSource{
+		Method:      AuthGoogleADC,
+		GoogleToken: tok.AccessToken,
 	}, nil
 }
 
-// ClearCache clears the cached credentials.
-func (g *GoogleAuthManager) ClearCache() {
-	g.mu.Lock()
-	defer g.mu.Unlock()
-	g.credentials = nil
-	g.lastRefresh = time.Time{}
-}
-
-// CheckGCPCredentialsValid checks if GCP credentials are currently valid.
-func (g *GoogleAuthManager) CheckGCPCredentialsValid(ctx context.Context) bool {
-	ctx, cancel := context.WithTimeout(ctx, gcpCredentialsCheckTimeout)
-	defer cancel()
-
-	token, err := g.GetAccessToken(ctx)
-	if err != nil {
-		return false
-	}
-
-	// Verify the token by making a simple API call
-	req, err := http.NewRequestWithContext(ctx, "GET", "https://www.googleapis.com/oauth2/v1/tokeninfo?access_token="+token, nil)
-	if err != nil {
-		return false
-	}
-
-	resp, err := http.DefaultClient.Do(req)
-	if err != nil {
-		return false
-	}
-	defer resp.Body.Close()
-
-	return resp.StatusCode == http.StatusOK
+// InvalidateVertexCache clears cached Vertex credentials.
+func InvalidateVertexCache() {
+	vp := vertexProviderInstance()
+	vp.mu.Lock()
+	vp.cached = nil
+	vp.fetchedAt = time.Time{}
+	vp.mu.Unlock()
 }

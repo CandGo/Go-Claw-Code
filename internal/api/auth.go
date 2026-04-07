@@ -7,30 +7,30 @@ import (
 	"strings"
 )
 
-// AuthMethod represents the authentication method used for API calls.
+// AuthMethod enumerates supported authentication strategies.
 type AuthMethod int
 
 const (
-	AuthAPIKey    AuthMethod = iota // Standard API key (x-api-key header)
-	AuthBearer                      // Bearer token (Authorization header)
-	AuthAWSSigV4                    // AWS Bedrock SigV4 signing
-	AuthGoogleADC                   // Google Vertex AI ADC token
-	AuthAzureToken                  // Azure Foundry token
+	AuthAPIKey    AuthMethod = iota // Standard x-api-key header
+	AuthBearer                      // Bearer token via Authorization header
+	AuthAWSSigV4                    // AWS Bedrock SigV4 request signing
+	AuthGoogleADC                   // Google Vertex AI via Application Default Credentials
+	AuthAzureToken                  // Azure Foundry via Azure AD token
 )
 
-// AuthSource represents the authentication method for API calls.
+// AuthSource holds resolved credentials for any provider.
 type AuthSource struct {
 	APIKey      string
 	BearerToken string
 	Method      AuthMethod
-	// Cloud provider fields
-	AWSCreds    *AWSCredentials
+	// Cloud provider credential fields
+	AWSCreds    *BedrockCreds
 	AWSRegion   string
 	GoogleToken string
 	AzureToken  string
 }
 
-// HasCredentials returns true if any credentials are present.
+// HasCredentials reports whether any credential data is present.
 func (a *AuthSource) HasCredentials() bool {
 	if a.APIKey != "" || a.BearerToken != "" {
 		return true
@@ -38,132 +38,112 @@ func (a *AuthSource) HasCredentials() bool {
 	return a.Method == AuthAWSSigV4 || a.Method == AuthGoogleADC || a.Method == AuthAzureToken
 }
 
-// DetectProviderFromEnv checks environment variables to determine which
-// cloud provider to use. Returns AuthAPIKey (default) if no cloud provider is detected.
+// envIsTruthy checks whether an env-var value represents an affirmative setting.
+func envIsTruthy(val string) bool {
+	switch strings.ToLower(strings.TrimSpace(val)) {
+	case "true", "1", "yes":
+		return true
+	}
+	return false
+}
+
+// DetectProviderFromEnv inspects standard environment variables to determine
+// which cloud provider should handle API requests. Returns AuthAPIKey when
+// no cloud provider override is detected.
 func DetectProviderFromEnv() AuthMethod {
-	if isEnvTruthy(os.Getenv("CLAUDE_CODE_USE_BEDROCK")) {
+	if envIsTruthy(os.Getenv("CLAUDE_CODE_USE_BEDROCK")) {
 		return AuthAWSSigV4
 	}
-	if isEnvTruthy(os.Getenv("CLAUDE_CODE_USE_VERTEX")) {
+	if envIsTruthy(os.Getenv("CLAUDE_CODE_USE_VERTEX")) {
 		return AuthGoogleADC
 	}
-	if isEnvTruthy(os.Getenv("CLAUDE_CODE_USE_FOUNDRY")) {
+	if envIsTruthy(os.Getenv("CLAUDE_CODE_USE_FOUNDRY")) {
 		return AuthAzureToken
 	}
 	return AuthAPIKey
 }
 
-// ResolveAuthForProvider resolves credentials for a specific cloud provider.
+// ResolveAuthForProvider obtains credentials for the detected cloud provider.
 func ResolveAuthForProvider(method AuthMethod, model string) (*AuthSource, error) {
 	ctx := context.Background()
-
 	switch method {
 	case AuthAWSSigV4:
-		return resolveAWSAuth(ctx, model)
+		return resolveBedrockAuth(ctx, model)
 	case AuthGoogleADC:
-		return resolveGoogleAuth(ctx, model)
+		return resolveVertexAuth(ctx)
 	case AuthAzureToken:
-		return resolveAzureAuth(ctx)
+		return resolveFoundryAuth(ctx)
 	default:
 		return nil, fmt.Errorf("unsupported auth method: %d", method)
 	}
 }
 
-// BaseURLForProvider returns the appropriate base URL for a cloud provider.
+// BaseURLForProvider returns the API endpoint appropriate for the given provider.
 func BaseURLForProvider(method AuthMethod, model string) string {
 	switch method {
 	case AuthAWSSigV4:
-		region := getAWSRegion()
+		r := awsRegion()
 		if model != "" {
-			if envRegion := os.Getenv("ANTHROPIC_SMALL_FAST_MODEL_AWS_REGION"); envRegion != "" {
-				region = envRegion
+			if alt := os.Getenv("ANTHROPIC_SMALL_FAST_MODEL_AWS_REGION"); alt != "" {
+				r = alt
 			}
 		}
-		return fmt.Sprintf("https://bedrock-runtime.%s.amazonaws.com", region)
-
+		return fmt.Sprintf("https://bedrock-runtime.%s.amazonaws.com", r)
 	case AuthGoogleADC:
-		region := getVertexRegionForModel(model)
-		projectID := os.Getenv("ANTHROPIC_VERTEX_PROJECT_ID")
+		r := vertexRegion(model)
+		pid := os.Getenv("ANTHROPIC_VERTEX_PROJECT_ID")
 		return fmt.Sprintf(
 			"https://%s-aiplatform.googleapis.com/v1/projects/%s/locations/%s/publishers/anthropic",
-			region, projectID, region,
+			r, pid, r,
 		)
-
 	case AuthAzureToken:
-		if baseURL := os.Getenv("ANTHROPIC_FOUNDRY_BASE_URL"); baseURL != "" {
-			return strings.TrimRight(baseURL, "/")
+		if u := strings.TrimSpace(os.Getenv("ANTHROPIC_FOUNDRY_BASE_URL")); u != "" {
+			return strings.TrimRight(u, "/")
 		}
-		if resource := os.Getenv("ANTHROPIC_FOUNDRY_RESOURCE"); resource != "" {
-			return fmt.Sprintf("https://%s.services.ai.azure.com/anthropic/v1", resource)
+		if res := os.Getenv("ANTHROPIC_FOUNDRY_RESOURCE"); res != "" {
+			return fmt.Sprintf("https://%s.services.ai.azure.com/anthropic/v1", res)
 		}
 		return ""
-
 	default:
 		return BaseURL()
 	}
 }
 
-func resolveAWSAuth(ctx context.Context, model string) (*AuthSource, error) {
-	auth := &AuthSource{Method: AuthAWSSigV4}
-	auth.AWSRegion = getAWSRegion()
-
-	// Bearer token auth (Bedrock API Key)
-	if bearerToken := os.Getenv("AWS_BEARER_TOKEN_BEDROCK"); bearerToken != "" {
-		auth.BearerToken = bearerToken
-		return auth, nil
+// awsRegion resolves the preferred AWS region from the environment.
+// Priority: AWS_REGION > AWS_DEFAULT_REGION > fallback "us-east-1".
+func awsRegion() string {
+	if r := os.Getenv("AWS_REGION"); r != "" {
+		return r
 	}
-
-	// Skip auth entirely
-	if isEnvTruthy(os.Getenv("CLAUDE_CODE_SKIP_BEDROCK_AUTH")) {
-		return auth, nil
+	if r := os.Getenv("AWS_DEFAULT_REGION"); r != "" {
+		return r
 	}
-
-	// Get credentials via auth manager
-	mgr := GetAWSAuthManager()
-	creds, err := mgr.RefreshAndGetAWSCredentials(ctx)
-	if err != nil {
-		return nil, fmt.Errorf("failed to get AWS credentials: %w", err)
-	}
-	auth.AWSCreds = creds
-	return auth, nil
+	return "us-east-1"
 }
 
-func resolveGoogleAuth(ctx context.Context, model string) (*AuthSource, error) {
-	auth := &AuthSource{Method: AuthGoogleADC}
-
-	if isEnvTruthy(os.Getenv("CLAUDE_CODE_SKIP_VERTEX_AUTH")) {
-		return auth, nil
+// vertexRegion picks a Vertex AI region, optionally influenced by the model name.
+func vertexRegion(model string) string {
+	m := strings.ToLower(model)
+	switch {
+	case strings.Contains(m, "haiku"):
+		if r := os.Getenv("VERTEX_REGION_CLAUDE_3_5_HAIKU"); r != "" {
+			return r
+		}
+		if r := os.Getenv("VERTEX_REGION_CLAUDE_HAIKU_4_5"); r != "" {
+			return r
+		}
+	case strings.Contains(m, "sonnet"):
+		if r := os.Getenv("VERTEX_REGION_CLAUDE_3_5_SONNET"); r != "" {
+			return r
+		}
+		if r := os.Getenv("VERTEX_REGION_CLAUDE_3_7_SONNET"); r != "" {
+			return r
+		}
 	}
-
-	mgr := GetGoogleAuthManager()
-	token, err := mgr.GetAccessToken(ctx)
-	if err != nil {
-		return nil, fmt.Errorf("failed to get Google credentials: %w", err)
+	if r := os.Getenv("CLOUD_ML_REGION"); r != "" {
+		return r
 	}
-	auth.GoogleToken = token
-	return auth, nil
-}
-
-func resolveAzureAuth(ctx context.Context) (*AuthSource, error) {
-	auth := &AuthSource{Method: AuthAzureToken}
-
-	// API key auth
-	if apiKey := os.Getenv("ANTHROPIC_FOUNDRY_API_KEY"); apiKey != "" {
-		auth.APIKey = apiKey
-		return auth, nil
-	}
-
-	if isEnvTruthy(os.Getenv("CLAUDE_CODE_SKIP_FOUNDRY_AUTH")) {
-		return auth, nil
-	}
-
-	mgr := GetAzureAuthManager()
-	token, err := mgr.GetAccessToken(ctx)
-	if err != nil {
-		return nil, fmt.Errorf("failed to get Azure credentials: %w", err)
-	}
-	auth.AzureToken = token
-	return auth, nil
+	return "us-east5"
 }
 
 // ResolveAuth discovers authentication credentials from environment variables.
@@ -174,7 +154,6 @@ func ResolveAuth() (*AuthSource, error) {
 		BearerToken: strings.TrimSpace(os.Getenv("CLAW_AUTH_TOKEN")),
 	}
 	if !auth.HasCredentials() {
-		// Fallback to ANTHROPIC_* env vars
 		auth = &AuthSource{
 			APIKey:      strings.TrimSpace(os.Getenv("ANTHROPIC_API_KEY")),
 			BearerToken: strings.TrimSpace(os.Getenv("ANTHROPIC_AUTH_TOKEN")),
@@ -190,7 +169,6 @@ func ResolveAuth() (*AuthSource, error) {
 }
 
 // BaseURL returns the API base URL from environment or default.
-// Checks CLAW_BASE_URL first, then ANTHROPIC_BASE_URL as fallback.
 func BaseURL() string {
 	if u := strings.TrimSpace(os.Getenv("CLAW_BASE_URL")); u != "" {
 		return strings.TrimRight(u, "/")

@@ -1,8 +1,9 @@
+// Package voice provides audio capture, transcription, and encoding utilities.
 package voice
 
 import (
 	"context"
-	"encoding/base64"
+	"encoding/binary"
 	"fmt"
 	"io"
 	"os/exec"
@@ -11,395 +12,247 @@ import (
 	"time"
 )
 
-// =============================================================================
-// Voice Recording
-// =============================================================================
-
-// RecordingConfig represents voice recording configuration.
-type RecordingConfig struct {
-	SampleRate       int           `json:"sampleRate"`
-	Channels         int           `json:"channels"`
-	SilenceDuration  float64       `json:"silenceDuration"`
-	SilenceThreshold string        `json:"silenceThreshold"`
-	MaxDuration      time.Duration `json:"maxDuration"`
+// CaptureConfig controls audio recording parameters.
+type CaptureConfig struct {
+	SampleRate  int
+	Channels    int
+	MaxDuration time.Duration
 }
 
-// DefaultRecordingConfig returns default recording configuration.
-func DefaultRecordingConfig() RecordingConfig {
-	return RecordingConfig{
-		SampleRate:       16000,
-		Channels:         1,
-		SilenceDuration:  2.0,
-		SilenceThreshold: "3%",
-		MaxDuration:      60 * time.Second,
+// DefaultCaptureConfig returns sensible defaults for speech recording.
+func DefaultCaptureConfig() CaptureConfig {
+	return CaptureConfig{
+		SampleRate:  16000,
+		Channels:    1,
+		MaxDuration: 60 * time.Second,
 	}
 }
 
-// Recorder represents a voice recorder.
-type Recorder struct {
-	config    RecordingConfig
-	cmd       *exec.Cmd
-	output    io.Reader
-	mu        sync.Mutex
-	recording bool
+// AudioCapture records raw PCM audio from the system microphone.
+type AudioCapture struct {
+	cfg    CaptureConfig
+	cmd    *exec.Cmd
+	stdout io.Reader
+	mu     sync.Mutex
+	active bool
 }
 
-// NewRecorder creates a new voice recorder.
-func NewRecorder(config RecordingConfig) *Recorder {
-	return &Recorder{
-		config: config,
-	}
+// NewCapture creates a new audio capture device.
+func NewCapture(cfg CaptureConfig) *AudioCapture {
+	return &AudioCapture{cfg: cfg}
 }
 
-// Start starts recording audio.
-func (r *Recorder) Start(ctx context.Context) error {
-	r.mu.Lock()
-	defer r.mu.Unlock()
+// Begin starts recording. It probes for available backends in order:
+// SoX rec > ALSA arecord > FFmpeg.
+func (ac *AudioCapture) Begin(ctx context.Context) error {
+	ac.mu.Lock()
+	defer ac.mu.Unlock()
 
-	if r.recording {
-		return fmt.Errorf("already recording")
+	if ac.active {
+		return fmt.Errorf("capture already in progress")
 	}
 
-	var cmd *exec.Cmd
-	var err error
-
-	// Try different recording methods
-	// Priority: sox (rec) > arecord (Linux) > ffmpeg
-	if r.hasCommand("rec") {
-		cmd = r.startSoxRecording(ctx)
-	} else if r.hasCommand("arecord") {
-		cmd = r.startArecordRecording(ctx)
-	} else if r.hasCommand("ffmpeg") {
-		cmd = r.startFFmpegRecording(ctx)
-	} else {
-		return fmt.Errorf("no audio recording command found (need sox, arecord, or ffmpeg)")
+	backend, args := ac.pickBackend(ctx)
+	if backend == "" {
+		return fmt.Errorf("no audio capture backend found (install sox, alsa-utils, or ffmpeg)")
 	}
 
-	r.output, err = cmd.StdoutPipe()
+	cmd := exec.CommandContext(ctx, backend, args...)
+	pipe, err := cmd.StdoutPipe()
 	if err != nil {
-		return fmt.Errorf("failed to create stdout pipe: %w", err)
+		return fmt.Errorf("pipe creation failed: %w", err)
 	}
-
 	if err := cmd.Start(); err != nil {
-		return fmt.Errorf("failed to start recording: %w", err)
+		return fmt.Errorf("failed to start %s: %w", backend, err)
 	}
 
-	r.cmd = cmd
-	r.recording = true
+	ac.cmd = cmd
+	ac.stdout = pipe
+	ac.active = true
 	return nil
 }
 
-// Stop stops recording and returns the audio data.
-func (r *Recorder) Stop() ([]byte, error) {
-	r.mu.Lock()
-	defer r.mu.Unlock()
+// Finish stops recording and returns captured PCM data.
+func (ac *AudioCapture) Finish() ([]byte, error) {
+	ac.mu.Lock()
+	defer ac.mu.Unlock()
 
-	if !r.recording || r.cmd == nil {
-		return nil, fmt.Errorf("not recording")
+	if !ac.active || ac.cmd == nil || ac.cmd.Process == nil {
+		return nil, fmt.Errorf("not currently capturing")
 	}
+	ac.cmd.Process.Kill()
 
-	if err := r.cmd.Process.Kill(); err != nil {
-		return nil, fmt.Errorf("failed to stop recording: %w", err)
-	}
-
-	data, err := io.ReadAll(r.output)
+	data, err := io.ReadAll(ac.stdout)
 	if err != nil {
-		return nil, fmt.Errorf("failed to read audio data: %w", err)
+		return nil, fmt.Errorf("failed reading audio: %w", err)
 	}
 
-	r.recording = false
-	r.cmd = nil
+	ac.active = false
+	ac.cmd = nil
 	return data, nil
 }
 
-// IsRecording returns true if currently recording.
-func (r *Recorder) IsRecording() bool {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	return r.recording
+// Active reports whether a capture is in progress.
+func (ac *AudioCapture) Active() bool {
+	ac.mu.Lock()
+	defer ac.mu.Unlock()
+	return ac.active
 }
 
-func (r *Recorder) hasCommand(cmd string) bool {
-	_, err := exec.LookPath(cmd)
-	return err == nil
-}
+func (ac *AudioCapture) pickBackend(_ context.Context) (string, []string) {
+	sr := fmt.Sprintf("%d", ac.cfg.SampleRate)
+	ch := fmt.Sprintf("%d", ac.cfg.Channels)
 
-func (r *Recorder) startSoxRecording(ctx context.Context) *exec.Cmd {
-	args := []string{
-		"-t", "raw",
-		"-r", fmt.Sprintf("%d", r.config.SampleRate),
-		"-e", "signed-integer",
-		"-b", "16",
-		"-c", fmt.Sprintf("%d", r.config.Channels),
-		"-",
-		"silence", "1", "0.1", r.config.SilenceThreshold,
-		"1", fmt.Sprintf("%.1f", r.config.SilenceDuration), r.config.SilenceThreshold,
+	if _, err := exec.LookPath("rec"); err == nil {
+		return "rec", []string{"-t", "raw", "-r", sr, "-e", "signed-integer", "-b", "16", "-c", ch, "-"}
 	}
-	return exec.CommandContext(ctx, "rec", args...)
-}
-
-func (r *Recorder) startArecordRecording(ctx context.Context) *exec.Cmd {
-	args := []string{
-		"-f", "S16_LE",
-		"-r", fmt.Sprintf("%d", r.config.SampleRate),
-		"-c", fmt.Sprintf("%d", r.config.Channels),
-		"-t", "raw",
-		"-",
+	if _, err := exec.LookPath("arecord"); err == nil {
+		return "arecord", []string{"-f", "S16_LE", "-r", sr, "-c", ch, "-t", "raw", "-"}
 	}
-	return exec.CommandContext(ctx, "arecord", args...)
-}
-
-func (r *Recorder) startFFmpegRecording(ctx context.Context) *exec.Cmd {
-	args := []string{
-		"-f", "alsa",
-		"-i", "default",
-		"-f", "s16le",
-		"-ac", fmt.Sprintf("%d", r.config.Channels),
-		"-ar", fmt.Sprintf("%d", r.config.SampleRate),
-		"-",
+	if _, err := exec.LookPath("ffmpeg"); err == nil {
+		return "ffmpeg", []string{"-f", "alsa", "-i", "default", "-f", "s16le", "-ac", ch, "-ar", sr, "-"}
 	}
-	return exec.CommandContext(ctx, "ffmpeg", args...)
+	return "", nil
 }
 
-// =============================================================================
-// Speech-to-Text
-// =============================================================================
-
-// Transcriber represents a speech-to-text service.
+// Transcriber converts raw audio bytes into text.
 type Transcriber interface {
-	Transcribe(ctx context.Context, audioData []byte) (string, error)
+	Transcribe(ctx context.Context, pcmData []byte) (string, error)
 }
 
-// MockTranscriber is a mock transcriber for testing.
-type MockTranscriber struct {
-	Response string
+// StubTranscriber returns a fixed response. Useful for testing.
+type StubTranscriber struct {
+	Text string
 }
 
-// Transcribe returns a mock transcription.
-func (t *MockTranscriber) Transcribe(ctx context.Context, audioData []byte) (string, error) {
-	return t.Response, nil
+func (s *StubTranscriber) Transcribe(_ context.Context, _ []byte) (string, error) {
+	return s.Text, nil
 }
 
-// =============================================================================
-// Voice Service
-// =============================================================================
-
-// Service represents the voice service.
-type Service struct {
-	recorder    *Recorder
+// VoiceInput combines capture and transcription into a single workflow.
+type VoiceInput struct {
+	capture     *AudioCapture
 	transcriber Transcriber
 	mu          sync.Mutex
-	enabled     bool
+	on          bool
 }
 
-// NewService creates a new voice service.
-func NewService(config RecordingConfig, transcriber Transcriber) *Service {
-	return &Service{
-		recorder:    NewRecorder(config),
-		transcriber: transcriber,
-		enabled:     false,
+// NewVoiceInput creates a ready-to-use voice input service.
+func NewVoiceInput(cfg CaptureConfig, t Transcriber) *VoiceInput {
+	return &VoiceInput{
+		capture:     NewCapture(cfg),
+		transcriber: t,
 	}
 }
 
-// Enable enables voice input.
-func (s *Service) Enable() {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	s.enabled = true
+// Enable / Disable control whether voice input is available.
+func (v *VoiceInput) Enable()  { v.mu.Lock(); v.on = true; v.mu.Unlock() }
+func (v *VoiceInput) Disable() { v.mu.Lock(); v.on = false; v.mu.Unlock() }
+func (v *VoiceInput) Enabled() bool {
+	v.mu.Lock()
+	defer v.mu.Unlock()
+	return v.on
 }
 
-// Disable disables voice input.
-func (s *Service) Disable() {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	s.enabled = false
-}
-
-// IsEnabled returns true if voice input is enabled.
-func (s *Service) IsEnabled() bool {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	return s.enabled
-}
-
-// StartRecording starts voice recording.
-func (s *Service) StartRecording(ctx context.Context) error {
-	if !s.IsEnabled() {
-		return fmt.Errorf("voice input is disabled")
+// RecordAndTranscribe captures audio until stopped, then returns the transcribed text.
+func (v *VoiceInput) RecordAndTranscribe(ctx context.Context) (string, error) {
+	if !v.Enabled() {
+		return "", fmt.Errorf("voice input is disabled")
 	}
-	return s.recorder.Start(ctx)
-}
-
-// StopRecording stops recording and transcribes the audio.
-func (s *Service) StopRecording(ctx context.Context) (string, error) {
-	audioData, err := s.recorder.Stop()
+	if err := v.capture.Begin(ctx); err != nil {
+		return "", err
+	}
+	pcm, err := v.capture.Finish()
 	if err != nil {
 		return "", err
 	}
-	if len(audioData) == 0 {
-		return "", fmt.Errorf("no audio data recorded")
+	if len(pcm) == 0 {
+		return "", fmt.Errorf("captured zero audio samples")
 	}
-	return s.transcriber.Transcribe(ctx, audioData)
+	return v.transcriber.Transcribe(ctx, pcm)
 }
 
-// IsRecording returns true if currently recording.
-func (s *Service) IsRecording() bool {
-	return s.recorder.IsRecording()
-}
+// CaptureActive reports whether currently recording.
+func (v *VoiceInput) CaptureActive() bool { return v.capture.Active() }
 
-// =============================================================================
-// Voice Commands
-// =============================================================================
-
-// VoiceCommand represents a voice command.
-type VoiceCommand struct {
-	Type   string                 `json:"type"`
-	Action string                 `json:"action"`
-	Params map[string]interface{} `json:"params,omitempty"`
-}
-
-// ParseCommand parses a voice command from transcribed text.
-func ParseCommand(text string) *VoiceCommand {
-	text = strings.ToLower(text)
-
-	if strings.Contains(text, "go to") || strings.Contains(text, "open") {
-		return &VoiceCommand{
-			Type:   "navigation",
-			Action: "goto",
-			Params: map[string]interface{}{
-				"target": extractTarget(text),
-			},
-		}
-	}
-
-	if strings.Contains(text, "delete") || strings.Contains(text, "remove") {
-		return &VoiceCommand{
-			Type:   "edit",
-			Action: "delete",
-		}
-	}
-
-	if strings.Contains(text, "copy") {
-		return &VoiceCommand{
-			Type:   "edit",
-			Action: "copy",
-		}
-	}
-
-	if strings.Contains(text, "paste") {
-		return &VoiceCommand{
-			Type:   "edit",
-			Action: "paste",
-		}
-	}
-
-	if strings.Contains(text, "undo") {
-		return &VoiceCommand{
-			Type:   "edit",
-			Action: "undo",
-		}
-	}
-
-	if strings.Contains(text, "redo") {
-		return &VoiceCommand{
-			Type:   "edit",
-			Action: "redo",
-		}
-	}
-
-	if strings.Contains(text, "search") || strings.Contains(text, "find") {
-		return &VoiceCommand{
-			Type:   "search",
-			Action: "find",
-			Params: map[string]interface{}{
-				"query": extractQuery(text),
-			},
-		}
-	}
-
-	return &VoiceCommand{
-		Type:   "input",
-		Action: "text",
-		Params: map[string]interface{}{
-			"text": text,
-		},
-	}
-}
-
-func extractTarget(text string) string {
-	words := strings.Fields(text)
-	for i, word := range words {
-		if word == "to" || word == "open" {
-			if i+1 < len(words) {
-				return strings.Join(words[i+1:], " ")
-			}
-		}
-	}
-	return ""
-}
-
-func extractQuery(text string) string {
-	words := strings.Fields(text)
-	for i, word := range words {
-		if word == "search" || word == "find" || word == "for" {
-			if i+1 < len(words) {
-				return strings.Join(words[i+1:], " ")
-			}
-		}
-	}
-	return ""
-}
-
-// =============================================================================
-// Audio Encoding
-// =============================================================================
-
-// EncodeWAV encodes raw audio data to WAV format.
-func EncodeWAV(data []byte, sampleRate, channels int) []byte {
-	header := make([]byte, 44)
-
-	copy(header[0:4], []byte("RIFF"))
-	copy(header[8:12], []byte("WAVE"))
-
-	copy(header[12:16], []byte("fmt "))
-	header[16] = 16
-	header[20] = 1
-	header[22] = byte(channels)
-	header[24] = byte(sampleRate)
-	header[25] = byte(sampleRate >> 8)
-	header[26] = byte(sampleRate >> 16)
-	header[27] = byte(sampleRate >> 24)
+// WAV converts raw signed-16-bit PCM data into a complete WAV file.
+func WAV(pcm []byte, sampleRate, channels int) []byte {
+	dataSize := len(pcm)
 	byteRate := sampleRate * channels * 2
-	header[28] = byte(byteRate)
-	header[29] = byte(byteRate >> 8)
-	header[30] = byte(byteRate >> 16)
-	header[31] = byte(byteRate >> 24)
 	blockAlign := channels * 2
-	header[32] = byte(blockAlign)
-	header[33] = byte(blockAlign >> 8)
-	header[34] = 16
-	header[35] = 0
 
-	copy(header[36:40], []byte("data"))
-	dataSize := len(data)
-	header[40] = byte(dataSize)
-	header[41] = byte(dataSize >> 8)
-	header[42] = byte(dataSize >> 16)
-	header[43] = byte(dataSize >> 24)
+	buf := make([]byte, 44+len(pcm))
 
-	fileSize := uint32(36 + dataSize)
-	header[4] = byte(fileSize)
-	header[5] = byte(fileSize >> 8)
-	header[6] = byte(fileSize >> 16)
-	header[7] = byte(fileSize >> 24)
+	// RIFF header
+	copy(buf[0:4], "RIFF")
+	binary.LittleEndian.PutUint32(buf[4:8], uint32(36+dataSize))
+	copy(buf[8:12], "WAVE")
 
-	result := make([]byte, 0, 44+len(data))
-	result = append(result, header...)
-	result = append(result, data...)
-	return result
+	// fmt chunk
+	copy(buf[12:16], "fmt ")
+	binary.LittleEndian.PutUint32(buf[16:20], 16)           // chunk size
+	binary.LittleEndian.PutUint16(buf[20:22], 1)            // PCM
+	binary.LittleEndian.PutUint16(buf[22:24], uint16(channels))
+	binary.LittleEndian.PutUint32(buf[24:28], uint32(sampleRate))
+	binary.LittleEndian.PutUint32(buf[28:32], uint32(byteRate))
+	binary.LittleEndian.PutUint16(buf[32:34], uint16(blockAlign))
+	binary.LittleEndian.PutUint16(buf[34:36], 16)           // bits per sample
+
+	// data chunk
+	copy(buf[36:40], "data")
+	binary.LittleEndian.PutUint32(buf[40:44], uint32(dataSize))
+	copy(buf[44:], pcm)
+
+	return buf
 }
 
-// EncodeBase64 encodes audio data to base64.
-func EncodeBase64(data []byte) string {
-	return base64.StdEncoding.EncodeToString(data)
+// Intent represents a recognized voice command.
+type Intent struct {
+	Verb   string
+	Object string
+	Raw    string
+}
+
+// ParseIntent does lightweight keyword extraction on transcribed text.
+func ParseIntent(text string) Intent {
+	lower := strings.ToLower(text)
+	words := strings.Fields(lower)
+
+	verbs := map[string]string{
+		"go to": "navigate", "open": "navigate",
+		"delete": "delete", "remove": "delete",
+		"search": "search", "find": "search",
+		"copy": "copy", "paste": "paste",
+		"undo": "undo", "redo": "redo",
+	}
+
+	for phrase, verb := range verbs {
+		if strings.Contains(lower, phrase) {
+			obj := extractTail(words, phrase)
+			return Intent{Verb: verb, Object: obj, Raw: text}
+		}
+	}
+	return Intent{Verb: "input", Object: text, Raw: text}
+}
+
+func extractTail(words []string, trigger string) string {
+	parts := strings.Fields(trigger)
+	tailStart := -1
+	for i := 0; i <= len(words)-len(parts); i++ {
+		match := true
+		for j, p := range parts {
+			if words[i+j] != p {
+				match = false
+				break
+			}
+		}
+		if match {
+			tailStart = i + len(parts)
+			break
+		}
+	}
+	if tailStart >= 0 && tailStart < len(words) {
+		return strings.Join(words[tailStart:], " ")
+	}
+	return ""
 }

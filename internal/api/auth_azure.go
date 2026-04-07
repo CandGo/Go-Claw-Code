@@ -1,5 +1,3 @@
-// Package api provides API client functionality.
-// This file contains Azure Foundry authentication utilities.
 package api
 
 import (
@@ -16,131 +14,89 @@ import (
 	"time"
 )
 
-// AzureCredentials represents Azure AD credentials.
-type AzureCredentials struct {
-	AccessToken string    `json:"access_token"`
-	TokenType   string    `json:"token_type"`
-	ExpiresIn   int       `json:"expires_in"`
-	ExpiresOn   int64     `json:"expires_on"`
-	Expiry      time.Time `json:"-"`
-	Resource    string    `json:"resource"`
+// FoundryToken holds a resolved Azure AD access token.
+type FoundryToken struct {
+	AccessToken string
+	ExpiresAt   time.Time
 }
 
-// AzureAuthManager manages Azure authentication state.
-type AzureAuthManager struct {
-	mu          sync.RWMutex
-	credentials *AzureCredentials
-	lastRefresh time.Time
+// foundryProvider resolves Azure credentials for Foundry endpoints.
+type foundryProvider struct {
+	mu        sync.Mutex
+	cached    *FoundryToken
+	fetchedAt time.Time
 }
 
 var (
-	azureAuthManager     *AzureAuthManager
-	azureAuthManagerOnce sync.Once
+	foundrySingleton     *foundryProvider
+	foundrySingletonOnce sync.Once
 )
 
-// GetAzureAuthManager returns the singleton Azure auth manager.
-func GetAzureAuthManager() *AzureAuthManager {
-	azureAuthManagerOnce.Do(func() {
-		azureAuthManager = &AzureAuthManager{}
+func foundryProviderInstance() *foundryProvider {
+	foundrySingletonOnce.Do(func() {
+		foundrySingleton = &foundryProvider{}
 	})
-	return azureAuthManager
+	return foundrySingleton
 }
 
-// Default TTL for Azure credentials (1 hour)
-const defaultAzureCredentialTTL = 60 * time.Minute
+const foundryTokenTTL = 60 * time.Minute
+const foundryCognitiveResource = "https://cognitiveservices.azure.com/.default"
 
-// Azure resource for Cognitive Services
-const azureCognitiveServicesResource = "https://cognitiveservices.azure.com/.default"
+// A foundryResolver produces a FoundryToken or returns an error.
+type foundryResolver func(ctx context.Context) (*FoundryToken, error)
 
-// RefreshAzureCredentialsIfNeeded refreshes Azure credentials if needed.
-func (a *AzureAuthManager) RefreshAzureCredentialsIfNeeded(ctx context.Context) error {
-	a.mu.Lock()
-	defer a.mu.Unlock()
+// accessToken returns a cached token if still valid, otherwise resolves a new one.
+func (fp *foundryProvider) accessToken(ctx context.Context) (*FoundryToken, error) {
+	fp.mu.Lock()
+	defer fp.mu.Unlock()
 
-	// Check if credentials are still valid
-	if a.credentials != nil && time.Now().Before(a.credentials.Expiry) {
-		return nil
+	if fp.cached != nil && time.Now().Before(fp.cached.ExpiresAt) {
+		return fp.cached, nil
 	}
 
-	// Try to get credentials from various sources
-	creds, err := a.getCredentials(ctx)
-	if err != nil {
-		return fmt.Errorf("failed to get Azure credentials: %w", err)
+	resolvers := []foundryResolver{
+		fp.fromAPIKey,
+		fp.fromServicePrincipal,
+		fp.fromAzureCLI,
+		fp.fromManagedIdentity,
 	}
 
-	a.credentials = creds
-	a.lastRefresh = time.Now()
-	return nil
-}
-
-// GetAccessToken returns the current access token.
-func (a *AzureAuthManager) GetAccessToken(ctx context.Context) (string, error) {
-	if err := a.RefreshAzureCredentialsIfNeeded(ctx); err != nil {
-		return "", err
-	}
-
-	a.mu.RLock()
-	defer a.mu.RUnlock()
-
-	if a.credentials == nil {
-		return "", fmt.Errorf("no Azure credentials available")
-	}
-
-	return a.credentials.AccessToken, nil
-}
-
-// getCredentials attempts to get Azure credentials from multiple sources.
-func (a *AzureAuthManager) getCredentials(ctx context.Context) (*AzureCredentials, error) {
-	// 1. Check for explicit API key (Foundry API Key)
-	if apiKey := os.Getenv("ANTHROPIC_FOUNDRY_API_KEY"); apiKey != "" {
-		// API key authentication - no need for AD token
-		// Return empty credentials, the API key will be used directly
-		return &AzureCredentials{}, nil
-	}
-
-	// 2. Check for service principal credentials
-	if tenantID := os.Getenv("AZURE_TENANT_ID"); tenantID != "" {
-		creds, err := a.getServicePrincipalToken(ctx)
-		if err == nil && creds != nil {
-			return creds, nil
+	for _, resolve := range resolvers {
+		tok, err := resolve(ctx)
+		if err == nil && tok != nil {
+			fp.cached = tok
+			fp.fetchedAt = time.Now()
+			return tok, nil
 		}
 	}
-
-	// 3. Try Azure CLI credentials
-	creds, err := a.getAzureCLIToken(ctx)
-	if err == nil && creds != nil {
-		return creds, nil
-	}
-
-	// 4. Try managed identity (if running on Azure)
-	creds, err = a.getManagedIdentityToken(ctx)
-	if err == nil && creds != nil {
-		return creds, nil
-	}
-
 	return nil, fmt.Errorf("no Azure credentials found")
 }
 
-// getServicePrincipalToken gets a token using service principal credentials.
-func (a *AzureAuthManager) getServicePrincipalToken(ctx context.Context) (*AzureCredentials, error) {
-	tenantID := os.Getenv("AZURE_TENANT_ID")
-	clientID := os.Getenv("AZURE_CLIENT_ID")
-	clientSecret := os.Getenv("AZURE_CLIENT_SECRET")
+// fromAPIKey checks for ANTHROPIC_FOUNDRY_API_KEY (static key, no token needed).
+func (fp *foundryProvider) fromAPIKey(_ context.Context) (*FoundryToken, error) {
+	if os.Getenv("ANTHROPIC_FOUNDRY_API_KEY") != "" {
+		return &FoundryToken{ExpiresAt: time.Now().Add(365 * 24 * time.Hour)}, nil
+	}
+	return nil, fmt.Errorf("no API key")
+}
 
-	if tenantID == "" || clientID == "" || clientSecret == "" {
-		return nil, fmt.Errorf("missing service principal configuration")
+// fromServicePrincipal uses AZURE_TENANT_ID + AZURE_CLIENT_ID + AZURE_CLIENT_SECRET.
+func (fp *foundryProvider) fromServicePrincipal(ctx context.Context) (*FoundryToken, error) {
+	tenant := os.Getenv("AZURE_TENANT_ID")
+	cid := os.Getenv("AZURE_CLIENT_ID")
+	secret := os.Getenv("AZURE_CLIENT_SECRET")
+	if tenant == "" || cid == "" || secret == "" {
+		return nil, fmt.Errorf("service principal env vars incomplete")
 	}
 
-	// OAuth2 token endpoint for Azure AD
-	tokenURL := fmt.Sprintf("https://login.microsoftonline.com/%s/oauth2/v2.0/token", tenantID)
+	endpoint := fmt.Sprintf("https://login.microsoftonline.com/%s/oauth2/v2.0/token", tenant)
+	form := url.Values{}
+	form.Set("client_id", cid)
+	form.Set("client_secret", secret)
+	form.Set("scope", foundryCognitiveResource)
+	form.Set("grant_type", "client_credentials")
 
-	data := url.Values{}
-	data.Set("client_id", clientID)
-	data.Set("client_secret", clientSecret)
-	data.Set("scope", azureCognitiveServicesResource)
-	data.Set("grant_type", "client_credentials")
-
-	req, err := http.NewRequestWithContext(ctx, "POST", tokenURL, strings.NewReader(data.Encode()))
+	req, err := http.NewRequestWithContext(ctx, "POST", endpoint, strings.NewReader(form.Encode()))
 	if err != nil {
 		return nil, err
 	}
@@ -148,82 +104,69 @@ func (a *AzureAuthManager) getServicePrincipalToken(ctx context.Context) (*Azure
 
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
-		return nil, fmt.Errorf("failed to get service principal token: %w", err)
+		return nil, fmt.Errorf("SP token request failed: %w", err)
 	}
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {
 		body, _ := io.ReadAll(resp.Body)
-		return nil, fmt.Errorf("token request failed with status %d: %s", resp.StatusCode, string(body))
+		return nil, fmt.Errorf("SP token returned HTTP %d: %s", resp.StatusCode, string(body))
 	}
 
+	var parsed struct {
+		AccessToken string `json:"access_token"`
+		ExpiresIn   int    `json:"expires_in"`
+	}
 	body, err := io.ReadAll(resp.Body)
 	if err != nil {
-		return nil, fmt.Errorf("failed to read token response: %w", err)
+		return nil, err
+	}
+	if err := json.Unmarshal(body, &parsed); err != nil {
+		return nil, err
 	}
 
-	var tokenResp struct {
-		AccessToken string `json:"access_token"`
-		TokenType   string `json:"token_type"`
-		ExpiresIn   int    `json:"expires_in"`
-		ExpiresOn   int64  `json:"expires_on"`
-	}
-
-	if err := json.Unmarshal(body, &tokenResp); err != nil {
-		return nil, fmt.Errorf("failed to parse token response: %w", err)
-	}
-
-	return &AzureCredentials{
-		AccessToken: tokenResp.AccessToken,
-		TokenType:   tokenResp.TokenType,
-		ExpiresIn:   tokenResp.ExpiresIn,
-		ExpiresOn:   tokenResp.ExpiresOn,
-		Expiry:      time.Now().Add(time.Duration(tokenResp.ExpiresIn) * time.Second),
+	return &FoundryToken{
+		AccessToken: parsed.AccessToken,
+		ExpiresAt:   time.Now().Add(time.Duration(parsed.ExpiresIn) * time.Second),
 	}, nil
 }
 
-// getAzureCLIToken gets a token using Azure CLI.
-func (a *AzureAuthManager) getAzureCLIToken(ctx context.Context) (*AzureCredentials, error) {
+// fromAzureCLI runs `az account get-access-token`.
+func (fp *foundryProvider) fromAzureCLI(ctx context.Context) (*FoundryToken, error) {
 	ctx, cancel := context.WithTimeout(ctx, 10*time.Second)
 	defer cancel()
 
-	// Try az account get-access-token
-	cmd := exec.CommandContext(ctx, "az", "account", "get-access-token", "--resource", "https://cognitiveservices.azure.com", "--output", "json")
-	output, err := cmd.Output()
+	out, err := exec.CommandContext(ctx, "az", "account", "get-access-token",
+		"--resource", "https://cognitiveservices.azure.com", "--output", "json").Output()
 	if err != nil {
-		return nil, fmt.Errorf("Azure CLI auth failed: %w", err)
+		return nil, err
 	}
 
-	var tokenResp struct {
+	var parsed struct {
 		AccessToken string `json:"accessToken"`
-		TokenType   string `json:"tokenType"`
-		ExpiresIn   int    `json:"expiresIn"`
 		ExpiresOn   string `json:"expiresOn"`
 	}
-
-	if err := json.Unmarshal(output, &tokenResp); err != nil {
-		return nil, fmt.Errorf("failed to parse Azure CLI response: %w", err)
+	if err := json.Unmarshal(out, &parsed); err != nil {
+		return nil, err
 	}
 
-	expiry, _ := time.Parse(time.RFC3339, tokenResp.ExpiresOn)
+	expiry, _ := time.Parse(time.RFC3339, parsed.ExpiresOn)
+	if expiry.IsZero() {
+		expiry = time.Now().Add(foundryTokenTTL)
+	}
 
-	return &AzureCredentials{
-		AccessToken: tokenResp.AccessToken,
-		TokenType:   tokenResp.TokenType,
-		ExpiresIn:   tokenResp.ExpiresIn,
-		Expiry:      expiry,
+	return &FoundryToken{
+		AccessToken: parsed.AccessToken,
+		ExpiresAt:   expiry,
 	}, nil
 }
 
-// getManagedIdentityToken gets a token using Azure Managed Identity.
-func (a *AzureAuthManager) getManagedIdentityToken(ctx context.Context) (*AzureCredentials, error) {
+// fromManagedIdentity queries the Azure Instance Metadata Service (IMDS).
+func (fp *foundryProvider) fromManagedIdentity(ctx context.Context) (*FoundryToken, error) {
 	ctx, cancel := context.WithTimeout(ctx, 10*time.Second)
 	defer cancel()
 
-	// Try Azure Instance Metadata Service (IMDS)
-	// First, check if we're running on Azure
 	imdsURL := "http://169.254.169.254/metadata/identity/oauth2/token"
-
 	params := url.Values{}
 	params.Set("api-version", "2018-02-01")
 	params.Set("resource", "https://cognitiveservices.azure.com")
@@ -236,46 +179,62 @@ func (a *AzureAuthManager) getManagedIdentityToken(ctx context.Context) (*AzureC
 
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
-		return nil, fmt.Errorf("managed identity request failed: %w", err)
+		return nil, fmt.Errorf("IMDS unreachable: %w", err)
 	}
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("managed identity returned status %d", resp.StatusCode)
+		return nil, fmt.Errorf("IMDS returned HTTP %d", resp.StatusCode)
 	}
 
 	body, err := io.ReadAll(resp.Body)
 	if err != nil {
-		return nil, fmt.Errorf("failed to read managed identity response: %w", err)
+		return nil, err
 	}
 
-	var tokenResp struct {
+	var parsed struct {
 		AccessToken string `json:"access_token"`
-		TokenType   string `json:"token_type"`
 		ExpiresIn   string `json:"expires_in"`
-		ExpiresOn   string `json:"expires_on"`
-		Resource    string `json:"resource"`
+	}
+	if err := json.Unmarshal(body, &parsed); err != nil {
+		return nil, err
 	}
 
-	if err := json.Unmarshal(body, &tokenResp); err != nil {
-		return nil, fmt.Errorf("failed to parse managed identity response: %w", err)
+	dur, _ := time.ParseDuration(parsed.ExpiresIn + "s")
+	if dur == 0 {
+		dur = foundryTokenTTL
 	}
 
-	expiresIn, _ := time.ParseDuration(tokenResp.ExpiresIn + "s")
-
-	return &AzureCredentials{
-		AccessToken: tokenResp.AccessToken,
-		TokenType:   tokenResp.TokenType,
-		ExpiresIn:   int(expiresIn.Seconds()),
-		Expiry:      time.Now().Add(expiresIn),
-		Resource:    tokenResp.Resource,
+	return &FoundryToken{
+		AccessToken: parsed.AccessToken,
+		ExpiresAt:   time.Now().Add(dur),
 	}, nil
 }
 
-// ClearCache clears the cached credentials.
-func (a *AzureAuthManager) ClearCache() {
-	a.mu.Lock()
-	defer a.mu.Unlock()
-	a.credentials = nil
-	a.lastRefresh = time.Time{}
+// resolveFoundryAuth builds an AuthSource for Azure Foundry.
+func resolveFoundryAuth(ctx context.Context) (*AuthSource, error) {
+	fp := foundryProviderInstance()
+	tok, err := fp.accessToken(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("foundry: %w", err)
+	}
+	auth := &AuthSource{
+		Method: AuthAzureToken,
+	}
+	// If an API key was configured, use it directly as the key header.
+	if key := os.Getenv("ANTHROPIC_FOUNDRY_API_KEY"); key != "" {
+		auth.APIKey = key
+	} else {
+		auth.AzureToken = tok.AccessToken
+	}
+	return auth, nil
+}
+
+// InvalidateFoundryCache clears cached Foundry credentials.
+func InvalidateFoundryCache() {
+	fp := foundryProviderInstance()
+	fp.mu.Lock()
+	fp.cached = nil
+	fp.fetchedAt = time.Time{}
+	fp.mu.Unlock()
 }
