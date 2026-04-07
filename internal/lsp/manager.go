@@ -289,6 +289,12 @@ func (m *LspManager) Shutdown(ctx context.Context) error {
 	return firstErr
 }
 
+// ClientForPath returns (or lazily creates) the LSP client for a given file path.
+// This is the exported version of clientForPath.
+func (m *LspManager) ClientForPath(ctx context.Context, path string) (*Client, error) {
+	return m.clientForPath(ctx, path)
+}
+
 // clientForPath returns (or lazily creates) the LSP client for a given file path.
 // Mirrors Rust LspManager::client_for_path.
 func (m *LspManager) clientForPath(ctx context.Context, path string) (*Client, error) {

@@ -117,6 +117,14 @@ func NewToolRegistry() *ToolRegistry {
 	r.register(replTool())
 	r.register(powershellTool())
 
+	// Team / Multi-Agent tools
+	r.register(sendMessageTool())
+	r.register(teamCreateTool())
+	r.register(teamDeleteTool())
+
+	// Extended LSP tool (30+ language detection)
+	r.register(lspExtendedTool())
+
 	globalRegistry = r
 	return r
 }
@@ -142,7 +150,7 @@ var planModeAllowedTools = map[string]bool{
 	"ToolSearch": true, "Skill": true, "Agent": true, "TodoWrite": true,
 	"NotebookEdit": true, "SendUserMessage": true, "sleep": true,
 	"StructuredOutput": true, "EnterPlanMode": true, "ExitPlanMode": true,
-	"AskUserQuestion": true,
+	"AskUserQuestion": true, "LSP": true, "SendMessage": true,
 }
 
 // planModeBashWhitelist prefixes allowed for bash in plan mode.
@@ -193,6 +201,11 @@ var toolAliases = map[string]string{
 	"plan_mode":      "EnterPlanMode",
 	"exit_plan":      "ExitPlanMode",
 	"send_message":   "SendUserMessage",
+	// Team/Multi-Agent aliases
+	"team_create":   "TeamCreate",
+	"team_delete":   "TeamDelete",
+	"sendmsg":       "SendMessage",
+	"lsp":           "LSP",
 }
 
 // Execute runs a tool by name.

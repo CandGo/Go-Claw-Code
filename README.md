@@ -4,7 +4,7 @@
 
 A Go reimplementation of [Claude Code](https://docs.anthropic.com/en/docs/claude-code) — Anthropic's agentic coding CLI.
 
-**96 Go files · 34K lines · 4 direct dependencies · zero AI SDKs** — raw Anthropic HTTP API with SSE streaming.
+**100+ Go files · 37K lines · 4 direct dependencies · zero AI SDKs** — raw Anthropic HTTP API with SSE streaming.
 
 > This is an independent community implementation and is not affiliated with or endorsed by Anthropic.
 
@@ -12,7 +12,7 @@ A Go reimplementation of [Claude Code](https://docs.anthropic.com/en/docs/claude
 
 ## Features
 
-### 38 Built-in Tools
+### 42 Built-in Tools
 
 | Category | Tools |
 |----------|-------|
@@ -26,6 +26,9 @@ A Go reimplementation of [Claude Code](https://docs.anthropic.com/en/docs/claude
 | Memory | WriteMemory |
 | MCP | MCPReadResource, MCPListResources, MCPListPrompts, MCPGetPrompt |
 | Worktree | EnterWorktree, ExitWorktree |
+| Multi-Agent | SendMessage, TeamCreate, TeamDelete |
+| LSP | LSP (30+ languages, 8 operations) |
+| Voice | Voice (SoX/ALSA/FFmpeg recording, WAV encoding) |
 | System | ToolSearch, NotebookEdit, Sleep, ClearScreen, StatusLine, Config, StructuredOutput |
 
 ### 39 Slash Commands
@@ -176,7 +179,7 @@ internal/
 | Language | Rust | Go |
 | Binary size | ~80MB | ~17MB |
 | Build time | minutes | seconds |
-| Tools | 38+ | 38 |
+| Tools | 38+ | 42 |
 | Slash Commands | 38+ | 39 |
 | Agent Types | 6 | 6 |
 | Permission Modes | 8 | 8 |
@@ -201,8 +204,8 @@ internal/
 | | **Go-Claw-Code** | **claude-code-go** |
 |--|------------------|--------------------|
 | Source | Original implementation | npm package reverse-engineered from source maps |
-| Go files | 96 | 114 |
-| Lines of code | ~34K | ~35K |
+| Go files | 100+ | 114 |
+| Lines of code | ~37K | ~35K |
 | Test files | **26** (all passing) | 1 |
 | CLI framework | flag (stdlib) | Cobra |
 | Docs language | English | Chinese |
@@ -215,24 +218,24 @@ internal/
 | Zhipu GLM | **yes** | no |
 | DeepSeek | **yes** | no |
 | OpenAI | **yes** | no |
-| AWS Bedrock | no | yes |
-| Google Vertex | no | yes |
-| Azure Foundry | no | yes |
+| AWS Bedrock | **yes** | yes |
+| Google Vertex | **yes** | yes |
+| Azure Foundry | **yes** | yes |
 
 ### Features
 
 | Feature | Go-Claw-Code | claude-code-go |
 |---------|:------------:|:--------------:|
-| Tools | 38 | 30+ |
+| Tools | **42** | 30+ |
 | Slash Commands | **39** | 7 |
 | Agent Types | 6 (with tool filtering) | TaskTool only |
 | Plugin System | **yes** | no |
 | Memory System | **yes** | no |
 | First-Run Wizard | **yes** | no |
 | Independent Config | **yes** (`~/.go-claw/`) | no (shares `~/.claude/`) |
-| Multi-Agent Teams | no | yes |
-| Voice | no | yes |
-| LSP Integration | basic | full (30+ languages) |
+| Multi-Agent Teams | **yes** | yes |
+| Voice | **yes** | yes |
+| LSP Integration | **yes** (30+ languages) | full (30+ languages) |
 | MCP Client | yes | yes |
 | Vim Mode | yes | yes |
 | LLM Compaction | yes | yes |
@@ -242,8 +245,7 @@ internal/
 
 ### Summary
 
-- **Choose Go-Claw-Code** for: multi-model support (GLM/DeepSeek/OpenAI), test coverage, rich slash commands, plugin extensibility, memory system, first-run wizard, independent config coexisting with Claude Code
-- **Choose claude-code-go** for: enterprise cloud providers (Bedrock/Vertex/Foundry), multi-agent teams, voice, comprehensive LSP support
+- **Choose Go-Claw-Code** for: multi-model support (GLM/DeepSeek/OpenAI), test coverage, rich slash commands, plugin extensibility, memory system, first-run wizard, independent config coexisting with Claude Code, enterprise cloud providers (Bedrock/Vertex/Foundry), multi-agent teams, voice, LSP with 30+ languages
 
 ## License
 

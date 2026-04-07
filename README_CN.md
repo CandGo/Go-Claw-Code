@@ -4,7 +4,7 @@
 
 [Claude Code](https://docs.anthropic.com/en/docs/claude-code) 的 Go 语言重新实现 — Anthropic 的智能编程 CLI 工具。
 
-**96 个 Go 文件 · 3.4 万行代码 · 4 个直接依赖 · 零 AI SDK** — 直接调用 Anthropic HTTP API，支持 SSE 流式输出。
+**100+ 个 Go 文件 · 3.7 万行代码 · 4 个直接依赖 · 零 AI SDK** — 直接调用 Anthropic HTTP API，支持 SSE 流式输出。
 
 > 本项目为独立社区实现，与 Anthropic 无关，也未获其认可。
 
@@ -12,7 +12,7 @@
 
 ## 功能特性
 
-### 38 个内置工具
+### 42 个内置工具
 
 | 分类 | 工具 |
 |------|------|
@@ -26,6 +26,9 @@
 | 记忆 | WriteMemory |
 | MCP | MCPReadResource、MCPListResources、MCPListPrompts、MCPGetPrompt |
 | 工作树 | EnterWorktree、ExitWorktree |
+| 多 Agent | SendMessage、TeamCreate、TeamDelete |
+| LSP | LSP（30+ 语言、8 种操作） |
+| 语音 | Voice（SoX/ALSA/FFmpeg 录音、WAV 编码） |
 | 系统 | ToolSearch、NotebookEdit、Sleep、ClearScreen、StatusLine、Config、StructuredOutput |
 
 ### 39 个斜杠命令
@@ -165,7 +168,7 @@ internal/
 ├── runtime/                # 对话循环、权限、Hook、压缩、会话
 ├── sandbox/                # 进程隔离
 ├── server/                 # HTTP 服务器模式
-├── tools/                  # 38 个工具实现
+├── tools/                  # 42 个工具实现
 └── tui/                    # Bubble Tea TUI
 ```
 
@@ -176,7 +179,7 @@ internal/
 | 语言 | Rust | Go |
 | 二进制大小 | ~80MB | ~17MB |
 | 编译时间 | 数分钟 | 数秒 |
-| 工具数 | 38+ | 38 |
+| 工具数 | 38+ | 42 |
 | 斜杠命令 | 38+ | 39 |
 | Agent 类型 | 6 | 6 |
 | 权限模式 | 8 | 8 |
@@ -201,8 +204,8 @@ internal/
 | | **Go-Claw-Code** | **claude-code-go** |
 |--|------------------|--------------------|
 | 来源 | 原创实现 | 从 npm 包 source map 反编译翻译 |
-| Go 文件 | 96 | 114 |
-| 代码行数 | ~3.4 万 | ~3.5 万 |
+| Go 文件 | 100+ | 114 |
+| 代码行数 | ~3.7 万 | ~3.5 万 |
 | 测试文件 | **26 个**（全部通过） | 1 个 |
 | CLI 框架 | flag（标准库） | Cobra |
 | 文档语言 | 英文 + 中文 | 中文 |
@@ -215,24 +218,24 @@ internal/
 | 智谱 GLM | **yes** | no |
 | DeepSeek | **yes** | no |
 | OpenAI | **yes** | no |
-| AWS Bedrock | no | yes |
-| Google Vertex | no | yes |
-| Azure Foundry | no | yes |
+| AWS Bedrock | **yes** | yes |
+| Google Vertex | **yes** | yes |
+| Azure Foundry | **yes** | yes |
 
 ### 功能对比
 
 | 功能 | Go-Claw-Code | claude-code-go |
 |------|:------------:|:--------------:|
-| 工具数 | 38 | 30+ |
+| 工具数 | **42** | 30+ |
 | 斜杠命令 | **39** | 7 |
 | Agent 类型 | 6（带工具过滤） | 仅 TaskTool |
 | 插件系统 | **yes** | no |
 | 记忆系统 | **yes** | no |
 | 首次运行向导 | **yes** | no |
 | 独立配置 | **yes**（`~/.go-claw/`） | no（共享 `~/.claude/`） |
-| 多 Agent 团队 | no | yes |
-| 语音 | no | yes |
-| LSP 集成 | 基础 | 完整（30+ 语言） |
+| 多 Agent 团队 | **yes** | yes |
+| 语音 | **yes** | yes |
+| LSP 集成 | **yes**（30+ 语言） | 完整（30+ 语言） |
 | MCP 客户端 | yes | yes |
 | Vim 模式 | yes | yes |
 | LLM 压缩 | yes | yes |
@@ -242,8 +245,7 @@ internal/
 
 ### 总结
 
-- **选择 Go-Claw-Code**：多模型支持（GLM/DeepSeek/OpenAI）、测试覆盖、丰富的斜杠命令、插件扩展、记忆系统、首次运行向导、与 Claude Code 共存的独立配置
-- **选择 claude-code-go**：企业云 Provider（Bedrock/Vertex/Foundry）、多 Agent 团队、语音、完整的 LSP 支持
+- **选择 Go-Claw-Code**：多模型支持（GLM/DeepSeek/OpenAI）、测试覆盖、丰富的斜杠命令、插件扩展、记忆系统、首次运行向导、与 Claude Code 共存的独立配置、企业云 Provider（Bedrock/Vertex/Foundry）、多 Agent 团队、语音、LSP 30+ 语言支持
 
 ## License
 
