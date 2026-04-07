@@ -153,7 +153,6 @@ Go-Claw-Code uses its own config directory (`~/.go-claw/`) — fully independent
 
 ```
 cmd/go-claw-code/           # Entry point
-cmd/tetris/                 # Tetris demo (Bubble Tea TUI)
 internal/
 ├── api/                    # Anthropic API (SSE streaming, retry, token tracking)
 ├── auth/                   # OAuth/PKCE + setup wizard + credentials

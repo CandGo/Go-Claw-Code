@@ -153,7 +153,6 @@ Go-Claw-Code 使用独立的配置目录（`~/.go-claw/`），与 Claude Code（
 
 ```
 cmd/go-claw-code/           # 入口
-cmd/tetris/                 # 俄罗斯方块演示（Bubble Tea TUI）
 internal/
 ├── api/                    # Anthropic API（SSE 流式、重试、Token 追踪）
 ├── auth/                   # OAuth/PKCE + 配置向导 + 凭证存储
