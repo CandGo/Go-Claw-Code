@@ -4,7 +4,7 @@
 
 A Go reimplementation of [Claude Code](https://docs.anthropic.com/en/docs/claude-code) — Anthropic's agentic coding CLI.
 
-**76 Go files · 29K lines · 4 direct dependencies · zero AI SDKs** — raw Anthropic HTTP API with SSE streaming. **33 test files · 305 test cases · all passing.**
+**109 Go files (76 source + 33 test) · 36K lines · 4 direct dependencies · zero AI SDKs** — raw Anthropic HTTP API with SSE streaming. **305 test cases · all passing.**
 
 > This is an independent community implementation and is not affiliated with or endorsed by Anthropic.
 
@@ -205,8 +205,8 @@ internal/
 | | **Go-Claw-Code** | **claude-code-go** |
 |--|------------------|--------------------|
 | Source | Original implementation | npm package reverse-engineered from source maps |
-| Go files | 76 | 114 |
-| Lines of code | ~29K | ~35K |
+| Go files | 109 | 114 |
+| Lines of code | ~36K | ~35K |
 | Test files | **33** (305 cases, all passing) | 1 |
 | CLI framework | flag (stdlib) | Cobra |
 | Docs language | English | Chinese |
