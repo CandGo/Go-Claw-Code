@@ -191,6 +191,59 @@ internal/
 | First-Run Wizard | no | yes |
 | Independent Config | no | yes |
 
+## Comparison with claude-code-go
+
+[claude-code-go](https://github.com/zwl698/claude-code-go) is another Go implementation of Claude Code, translated from the npm package's TypeScript source maps.
+
+### Overview
+
+| | **Go-Claw-Code** | **claude-code-go** |
+|--|------------------|--------------------|
+| Source | Original implementation | npm package reverse-engineered from source maps |
+| Go files | 96 | 114 |
+| Lines of code | ~34K | ~35K |
+| Test files | **26** (all passing) | 1 |
+| CLI framework | flag (stdlib) | Cobra |
+| Docs language | English | Chinese |
+
+### Provider Support
+
+| Provider | Go-Claw-Code | claude-code-go |
+|----------|:------------:|:--------------:|
+| Anthropic | yes | yes |
+| Zhipu GLM | **yes** | no |
+| DeepSeek | **yes** | no |
+| OpenAI | **yes** | no |
+| AWS Bedrock | no | yes |
+| Google Vertex | no | yes |
+| Azure Foundry | no | yes |
+
+### Features
+
+| Feature | Go-Claw-Code | claude-code-go |
+|---------|:------------:|:--------------:|
+| Tools | 38 | 30+ |
+| Slash Commands | **39** | 7 |
+| Agent Types | 6 (with tool filtering) | TaskTool only |
+| Plugin System | **yes** | no |
+| Memory System | **yes** | no |
+| First-Run Wizard | **yes** | no |
+| Independent Config | **yes** (`~/.go-claw/`) | no (shares `~/.claude/`) |
+| Multi-Agent Teams | no | yes |
+| Voice | no | yes |
+| LSP Integration | basic | full (30+ languages) |
+| MCP Client | yes | yes |
+| Vim Mode | yes | yes |
+| LLM Compaction | yes | yes |
+| Cron Scheduling | yes | yes |
+| Tool Error Preservation | **yes** (stderr preserved) | — |
+| Windows Adaptation | **yes** (CRLF, cmd.exe) | PowerShell tool |
+
+### Summary
+
+- **Choose Go-Claw-Code** for: multi-model support (GLM/DeepSeek/OpenAI), test coverage, rich slash commands, plugin extensibility, memory system, first-run wizard, independent config coexisting with Claude Code
+- **Choose claude-code-go** for: enterprise cloud providers (Bedrock/Vertex/Foundry), multi-agent teams, voice, comprehensive LSP support
+
 ## License
 
 MIT
