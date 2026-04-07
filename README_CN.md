@@ -4,7 +4,7 @@
 
 [Claude Code](https://docs.anthropic.com/en/docs/claude-code) 的 Go 语言重新实现 — Anthropic 的智能编程 CLI 工具。
 
-**100+ 个 Go 文件 · 3.7 万行代码 · 4 个直接依赖 · 零 AI SDK** — 直接调用 Anthropic HTTP API，支持 SSE 流式输出。
+**76 个 Go 文件 · 2.9 万行代码 · 4 个直接依赖 · 零 AI SDK** — 直接调用 Anthropic HTTP API，支持 SSE 流式输出。**33 个测试文件 · 305 个测试用例 · 全部通过。**
 
 > 本项目为独立社区实现，与 Anthropic 无关，也未获其认可。
 
@@ -169,7 +169,8 @@ internal/
 ├── sandbox/                # 进程隔离
 ├── server/                 # HTTP 服务器模式
 ├── tools/                  # 42 个工具实现
-└── tui/                    # Bubble Tea TUI
+├── tui/                    # Bubble Tea TUI
+└── voice/                  # 语音录音与转写
 ```
 
 ## 与 Rust 版 Claude Code 对比
@@ -204,9 +205,9 @@ internal/
 | | **Go-Claw-Code** | **claude-code-go** |
 |--|------------------|--------------------|
 | 来源 | 原创实现 | 从 npm 包 source map 反编译翻译 |
-| Go 文件 | 100+ | 114 |
-| 代码行数 | ~3.7 万 | ~3.5 万 |
-| 测试文件 | **26 个**（全部通过） | 1 个 |
+| Go 文件 | 76 | 114 |
+| 代码行数 | ~2.9 万 | ~3.5 万 |
+| 测试文件 | **33 个**（305 用例，全部通过） | 1 个 |
 | CLI 框架 | flag（标准库） | Cobra |
 | 文档语言 | 英文 + 中文 | 中文 |
 
