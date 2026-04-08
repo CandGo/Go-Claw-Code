@@ -14,7 +14,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/go-claw/claw/internal/config"
+	"github.com/CandGo/Go-Claw-Code/internal/config"
 )
 
 // --- JSON-RPC 2.0 Types ---

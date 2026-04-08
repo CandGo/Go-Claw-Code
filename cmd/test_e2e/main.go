@@ -7,8 +7,8 @@ import (
 	"os"
 	"time"
 
-	"github.com/go-claw/claw/internal/api"
-	clawauth "github.com/go-claw/claw/internal/auth"
+	"github.com/CandGo/Go-Claw-Code/internal/api"
+	clawauth "github.com/CandGo/Go-Claw-Code/internal/auth"
 )
 
 func main() {

@@ -11,7 +11,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/go-claw/claw/internal/sandbox"
+	"github.com/CandGo/Go-Claw-Code/internal/sandbox"
 )
 
 // BashCommandInput mirrors Rust BashCommandInput.

@@ -6,7 +6,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/go-claw/claw/internal/api"
+	"github.com/CandGo/Go-Claw-Code/internal/api"
 )
 
 // mockProvider implements api.Provider for testing.

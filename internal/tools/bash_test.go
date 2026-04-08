@@ -3,7 +3,7 @@ package tools
 import (
 	"testing"
 
-	"github.com/go-claw/claw/internal/sandbox"
+	"github.com/CandGo/Go-Claw-Code/internal/sandbox"
 )
 
 func TestExecuteBashSimpleCommand(t *testing.T) {

@@ -1,0 +1,52 @@
+<!DOCTYPE html>
+<html lang="en" data-theme="dark">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Go-Claw-Code</title>
+<link rel="stylesheet" href="/assets/style.css">
+<script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/highlight.min.js"></script>
+<link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/styles/github-dark.min.css" id="hljs-theme">
+<script src="https://cdn.jsdelivr.net/npm/dompurify@3/dist/purify.min.js"></script>
+</head>
+<body>
+<div id="app">
+  <header id="header">
+    <div class="header-left">
+      <h1>Go-Claw-Code</h1>
+      <span id="model-badge" class="badge">model</span>
+      <span id="version-badge" class="badge subtle">v0</span>
+    </div>
+    <div class="header-right">
+      <button id="btn-new" title="New session">+ New</button>
+      <button id="btn-theme" title="Toggle theme">&#9790;</button>
+    </div>
+  </header>
+
+  <div id="messages"></div>
+
+  <div id="permission-bar" class="hidden">
+    <div class="permission-content">
+      <span id="perm-tool" class="badge warn"></span>
+      <code id="perm-input"></code>
+    </div>
+    <div class="permission-actions">
+      <button id="btn-allow" class="btn-primary">Allow</button>
+      <button id="btn-allow-always" class="btn-secondary">Allow Always</button>
+      <button id="btn-deny" class="btn-danger">Deny</button>
+    </div>
+  </div>
+
+  <div id="input-area">
+    <textarea id="input" placeholder="Send a message... (Shift+Enter for new line)" rows="1"></textarea>
+    <button id="btn-send" title="Send">&#9654;</button>
+    <button id="btn-cancel" class="hidden" title="Cancel">&#9632;</button>
+  </div>
+</div>
+
+<script src="/assets/api.js"></script>
+<script src="/assets/markdown.js"></script>
+<script src="/assets/app.js"></script>
+</body>
+</html>

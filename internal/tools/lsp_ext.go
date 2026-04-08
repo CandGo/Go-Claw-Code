@@ -8,7 +8,7 @@ import (
 	"sort"
 	"strings"
 
-	"github.com/go-claw/claw/internal/lsp"
+	"github.com/CandGo/Go-Claw-Code/internal/lsp"
 )
 
 // =============================================================================

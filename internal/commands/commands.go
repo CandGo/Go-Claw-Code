@@ -9,10 +9,10 @@ import (
 	"strings"
 	"time"
 
-	clawauth "github.com/go-claw/claw/internal/auth"
-	"github.com/go-claw/claw/internal/plugins"
-	"github.com/go-claw/claw/internal/runtime"
-	"github.com/go-claw/claw/internal/tools"
+	clawauth "github.com/CandGo/Go-Claw-Code/internal/auth"
+	"github.com/CandGo/Go-Claw-Code/internal/plugins"
+	"github.com/CandGo/Go-Claw-Code/internal/runtime"
+	"github.com/CandGo/Go-Claw-Code/internal/tools"
 )
 
 // Version is set at build time via -ldflags.

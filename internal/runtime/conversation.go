@@ -7,7 +7,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/go-claw/claw/internal/api"
+	"github.com/CandGo/Go-Claw-Code/internal/api"
 )
 
 // ToolExecutor is the interface for executing tools.

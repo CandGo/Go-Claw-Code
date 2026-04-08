@@ -11,8 +11,8 @@ import (
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
 
-	"github.com/go-claw/claw/internal/commands"
-	"github.com/go-claw/claw/internal/runtime"
+	"github.com/CandGo/Go-Claw-Code/internal/commands"
+	"github.com/CandGo/Go-Claw-Code/internal/runtime"
 )
 
 // SessionState represents the current state of the TUI session.

@@ -6,7 +6,7 @@ import (
 	"fmt"
 	"time"
 
-	"github.com/go-claw/claw/internal/mcp"
+	"github.com/CandGo/Go-Claw-Code/internal/mcp"
 )
 
 // MCPResourceReader is the interface for reading MCP resources.

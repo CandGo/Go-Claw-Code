@@ -12,8 +12,8 @@ import (
 	"runtime"
 	"time"
 
-	"github.com/go-claw/claw/internal/api"
-	"github.com/go-claw/claw/internal/sandbox"
+	"github.com/CandGo/Go-Claw-Code/internal/api"
+	"github.com/CandGo/Go-Claw-Code/internal/sandbox"
 )
 
 // PermissionLevel defines the required permission for a tool.

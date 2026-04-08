@@ -5,7 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 
-	"github.com/go-claw/claw/internal/api"
+	"github.com/CandGo/Go-Claw-Code/internal/api"
 )
 
 // MakeLLMCompactionFunc returns an LLM-based summarization function suitable
