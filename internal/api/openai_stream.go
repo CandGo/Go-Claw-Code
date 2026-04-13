@@ -24,6 +24,9 @@ type oaiStreamDelta struct {
 	Role      string          `json:"role,omitempty"`
 	Content   *string         `json:"content,omitempty"`
 	ToolCalls []oaiStreamTool `json:"tool_calls,omitempty"`
+	// Reasoning content for o1/o3/DeepSeek-R1 models
+	ReasoningContent *string `json:"reasoning_content,omitempty"`
+	Reasoning        *string `json:"reasoning,omitempty"`
 }
 
 type oaiStreamTool struct {
@@ -50,6 +53,7 @@ type toolCallAccum struct {
 }
 
 // translateOpenAIStream reads OpenAI SSE chunks and emits Anthropic-format SSEFrames.
+// Supports reasoning_content/reasoning fields from o1, o3, DeepSeek-R1, etc.
 func translateOpenAIStream(r io.Reader) <-chan SSEFrame {
 	ch := make(chan SSEFrame, 64)
 	go func() {
@@ -60,18 +64,19 @@ func translateOpenAIStream(r io.Reader) <-chan SSEFrame {
 		scanner := bufio.NewScanner(r)
 		scanner.Buffer(make([]byte, 0, 64*1024), 1024*1024)
 
-		frameCount := 0
+		_ = 0 // frameCount unused but kept for compatibility
 
 		toolAccums := make(map[int]*toolCallAccum)
 		contentStarted := false
+		reasoningStarted := false
 		messageStarted := false
+		textBlockIndex := 0 // 0 if no reasoning, 1 if reasoning came first
 		msgID := "msg_openai"
 		inputTokens := 0
 		outputTokens := 0
 
 		for scanner.Scan() {
 			line := scanner.Text()
-			frameCount++
 			if !strings.HasPrefix(line, "data: ") {
 				continue
 			}
@@ -79,8 +84,13 @@ func translateOpenAIStream(r io.Reader) <-chan SSEFrame {
 
 			// Stream end
 			if data == "[DONE]" {
+				if reasoningStarted {
+					ch <- SSEFrame{Event: "event", Data: fmt.Sprintf(
+						`{"type":"content_block_stop","index":0}`)}
+				}
 				if contentStarted {
-					ch <- SSEFrame{Event: "event", Data: `{"type":"content_block_stop","index":0}`}
+					ch <- SSEFrame{Event: "event", Data: fmt.Sprintf(
+						`{"type":"content_block_stop","index":%d}`, textBlockIndex)}
 				}
 				for idx, ta := range toolAccums {
 					if ta.started {
@@ -120,17 +130,43 @@ func translateOpenAIStream(r io.Reader) <-chan SSEFrame {
 					msgID, inputTokens)}
 			}
 
+			// Reasoning/thinking content (o1, o3, DeepSeek-R1, etc.)
+			var reasoningText string
+			if choice.Delta.ReasoningContent != nil {
+				reasoningText = *choice.Delta.ReasoningContent
+			} else if choice.Delta.Reasoning != nil {
+				reasoningText = *choice.Delta.Reasoning
+			}
+			if reasoningText != "" {
+				if !reasoningStarted {
+					reasoningStarted = true
+					textBlockIndex = 1 // text will be at index 1 after reasoning
+					ch <- SSEFrame{Event: "event", Data: `{"type":"content_block_start","index":0,"content_block":{"type":"thinking","thinking":""}}`}
+				}
+				escaped, _ := json.Marshal(reasoningText)
+				ch <- SSEFrame{Event: "event", Data: fmt.Sprintf(
+					`{"type":"content_block_delta","index":0,"delta":{"type":"thinking_delta","thinking":%s}}`,
+					string(escaped))}
+			}
+
 			// Text content
 			if choice.Delta.Content != nil && *choice.Delta.Content != "" {
 				text := *choice.Delta.Content
+				// Close reasoning block if transitioning to text
+				if reasoningStarted {
+					ch <- SSEFrame{Event: "event", Data: `{"type":"content_block_stop","index":0}`}
+					reasoningStarted = false
+					textBlockIndex = 1
+				}
 				if !contentStarted {
 					contentStarted = true
-					ch <- SSEFrame{Event: "event", Data: `{"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}`}
+					ch <- SSEFrame{Event: "event", Data: fmt.Sprintf(
+						`{"type":"content_block_start","index":%d,"content_block":{"type":"text","text":""}}`, textBlockIndex)}
 				}
 				escaped, _ := json.Marshal(text)
 				ch <- SSEFrame{Event: "event", Data: fmt.Sprintf(
-					`{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":%s}}`,
-					string(escaped))}
+					`{"type":"content_block_delta","index":%d,"delta":{"type":"text_delta","text":%s}}`,
+					textBlockIndex, string(escaped))}
 			}
 
 			// Tool calls
@@ -141,9 +177,15 @@ func translateOpenAIStream(r io.Reader) <-chan SSEFrame {
 				}
 				ta := toolAccums[idx]
 
+				// Close reasoning block if open
+				if reasoningStarted {
+					ch <- SSEFrame{Event: "event", Data: `{"type":"content_block_stop","index":0}`}
+					reasoningStarted = false
+				}
 				// Close text block if still open
 				if contentStarted {
-					ch <- SSEFrame{Event: "event", Data: `{"type":"content_block_stop","index":0}`}
+					ch <- SSEFrame{Event: "event", Data: fmt.Sprintf(
+						`{"type":"content_block_stop","index":%d}`, textBlockIndex)}
 					contentStarted = false
 				}
 
@@ -180,9 +222,15 @@ func translateOpenAIStream(r io.Reader) <-chan SSEFrame {
 					stopReason = "tool_use"
 				}
 
+				// Close reasoning block if open
+				if reasoningStarted {
+					ch <- SSEFrame{Event: "event", Data: `{"type":"content_block_stop","index":0}`}
+					reasoningStarted = false
+				}
 				// Close content block if open
 				if contentStarted {
-					ch <- SSEFrame{Event: "event", Data: `{"type":"content_block_stop","index":0}`}
+					ch <- SSEFrame{Event: "event", Data: fmt.Sprintf(
+						`{"type":"content_block_stop","index":%d}`, textBlockIndex)}
 					contentStarted = false
 				}
 
