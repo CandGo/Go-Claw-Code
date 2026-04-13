@@ -493,13 +493,24 @@ func collapseBlankLines(s string) string {
 }
 
 // ---------------------------------------------------------------------------
-// WebSearch tool (unchanged)
+// WebSearch tool
 // ---------------------------------------------------------------------------
+
+// Pre-compiled DDG parsing regexes (avoids recompilation on every call)
+var (
+	ddgResultBlockRe = regexp.MustCompile(`(?s)<div class="result[^"]*">\s*.*?</div>\s*</div>`)
+	ddgTitleRe       = regexp.MustCompile(`class="result__a"[^>]*>(.*?)</a>`)
+	ddgSnippetRe     = regexp.MustCompile(`class="result__snippet"[^>]*>(.*?)</(?:a|span)>`)
+	ddgURLRe         = regexp.MustCompile(`href="(//duckduckgo\.com/l/\?uddg=[^"]*)"`)
+	ddgFallbackURLRe = regexp.MustCompile(`class="result__url"[^>]*>(.*?)</a>`)
+)
+
+const ddgUserAgent = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36"
 
 func webSearchTool() *ToolSpec {
 	return &ToolSpec{
 		Name:        "WebSearch",
-		Description: "Search the web using DuckDuckGo.",
+		Description: "Search the web using DuckDuckGo. Returns up to 10 results with titles, URLs, and snippets.",
 		InputSchema: map[string]interface{}{
 			"type": "object",
 			"additionalProperties": false,
@@ -524,11 +535,22 @@ func webSearchTool() *ToolSpec {
 					TLSClientConfig: &tls.Config{InsecureSkipVerify: false},
 				},
 			}
-			resp, err := client.Get(searchURL)
+
+			req, err := http.NewRequest("GET", searchURL, nil)
+			if err != nil {
+				return "", fmt.Errorf("search failed: %w", err)
+			}
+			req.Header.Set("User-Agent", ddgUserAgent)
+
+			resp, err := client.Do(req)
 			if err != nil {
 				return "", fmt.Errorf("search failed: %w", err)
 			}
 			defer resp.Body.Close()
+
+			if resp.StatusCode != 200 {
+				return "", fmt.Errorf("search returned HTTP %d", resp.StatusCode)
+			}
 
 			body, err := io.ReadAll(io.LimitReader(resp.Body, 256*1024))
 			if err != nil {
@@ -604,40 +626,61 @@ type ddgResult struct {
 func parseDDGResults(html string) []ddgResult {
 	var results []ddgResult
 
-	titleRe := regexp.MustCompile(`class="result__a"[^>]*>(.*?)</a>`)
-	snippetRe := regexp.MustCompile(`class="result__snippet"[^>]*>(.*?)</a>`)
-	urlRe := regexp.MustCompile(`href="(//duckduckgo.com/l/\?uddg=[^"]*)"`)
+	// Extract each result block and parse individually to avoid index misalignment
+	blocks := ddgResultBlockRe.FindAllString(html, -1)
+	if len(blocks) == 0 {
+		// Fallback to the old index-based approach
+		return parseDDGResultsLegacy(html)
+	}
 
-	titles := titleRe.FindAllStringSubmatch(html, -1)
-	snippets := snippetRe.FindAllStringSubmatch(html, -1)
-	urls := urlRe.FindAllStringSubmatch(html, -1)
+	for _, block := range blocks {
+		titleMatch := ddgTitleRe.FindStringSubmatch(block)
+		snippetMatch := ddgSnippetRe.FindStringSubmatch(block)
+		urlMatch := ddgURLRe.FindStringSubmatch(block)
+
+		if len(titleMatch) < 2 || len(urlMatch) < 2 {
+			continue
+		}
+
+		title := stripHTMLTags(titleMatch[1])
+		rawURL := decodeDDGURL(urlMatch[1])
+		snippet := ""
+		if len(snippetMatch) >= 2 {
+			snippet = stripHTMLTags(snippetMatch[1])
+		}
+
+		results = append(results, ddgResult{
+			Title:   strings.TrimSpace(title),
+			URL:     rawURL,
+			Snippet: strings.TrimSpace(snippet),
+		})
+
+		if len(results) >= 20 {
+			break
+		}
+	}
+	return results
+}
+
+// parseDDGResultsLegacy is the fallback index-based parser for when block parsing fails.
+func parseDDGResultsLegacy(html string) []ddgResult {
+	var results []ddgResult
+
+	titles := ddgTitleRe.FindAllStringSubmatch(html, -1)
+	snippets := ddgSnippetRe.FindAllStringSubmatch(html, -1)
+	urls := ddgURLRe.FindAllStringSubmatch(html, -1)
 
 	n := len(titles)
-	if len(snippets) < n {
-		n = len(snippets)
-	}
 	if len(urls) < n {
 		n = len(urls)
 	}
 
 	for i := 0; i < n && i < 20; i++ {
 		title := stripHTMLTags(titles[i][1])
-		snippet := stripHTMLTags(snippets[i][1])
-		rawURL := urls[i][1]
-
-		if strings.HasPrefix(rawURL, "//duckduckgo.com/l/?uddg=") {
-			encoded := strings.TrimPrefix(rawURL, "//duckduckgo.com/l/?uddg=")
-			if idx := strings.Index(encoded, "&"); idx != -1 {
-				encoded = encoded[:idx]
-			}
-			decoded, err := url.QueryUnescape(encoded)
-			if err == nil {
-				rawURL = decoded
-			} else {
-				rawURL = "https:" + rawURL
-			}
-		} else {
-			rawURL = "https:" + rawURL
+		rawURL := decodeDDGURL(urls[i][1])
+		snippet := ""
+		if i < len(snippets) {
+			snippet = stripHTMLTags(snippets[i][1])
 		}
 
 		results = append(results, ddgResult{
@@ -647,6 +690,21 @@ func parseDDGResults(html string) []ddgResult {
 		})
 	}
 	return results
+}
+
+// decodeDDGURL extracts the actual URL from DDG's redirect URL.
+func decodeDDGURL(rawURL string) string {
+	if strings.HasPrefix(rawURL, "//duckduckgo.com/l/?uddg=") {
+		encoded := strings.TrimPrefix(rawURL, "//duckduckgo.com/l/?uddg=")
+		if idx := strings.Index(encoded, "&"); idx != -1 {
+			encoded = encoded[:idx]
+		}
+		decoded, err := url.QueryUnescape(encoded)
+		if err == nil {
+			return decoded
+		}
+	}
+	return "https:" + rawURL
 }
 
 var htmlTagRe = regexp.MustCompile(`<[^>]+>`)
