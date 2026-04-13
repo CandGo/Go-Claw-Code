@@ -222,6 +222,70 @@ func (b *SystemPromptBuilder) Render() string {
 	return strings.Join(b.Build(), "\n\n")
 }
 
+// CachedSystemBlock is a system prompt content block with optional cache control.
+type CachedSystemBlock struct {
+	Type        string `json:"type"`
+	Text        string `json:"text"`
+	CacheControl *struct {
+		Type string `json:"type"`
+	} `json:"cache_control,omitempty"`
+}
+
+// BuildCachedSystem builds the system prompt as an array of content blocks
+// with cache_control breakpoints at the static/dynamic boundary.
+// This enables Anthropic prompt caching to reuse the static prefix across turns.
+func (b *SystemPromptBuilder) BuildCachedSystem() []CachedSystemBlock {
+	sections := b.Build()
+	var blocks []CachedSystemBlock
+
+	// Split at the dynamic boundary
+	staticParts := make([]string, 0)
+	dynamicParts := make([]string, 0)
+	pastBoundary := false
+
+	for _, s := range sections {
+		if s == SystemPromptDynamicBoundary {
+			pastBoundary = true
+			continue
+		}
+		if pastBoundary {
+			dynamicParts = append(dynamicParts, s)
+		} else {
+			staticParts = append(staticParts, s)
+		}
+	}
+
+	// Static section: joined, with cache_control at the end
+	if len(staticParts) > 0 {
+		blocks = append(blocks, CachedSystemBlock{
+			Type: "text",
+			Text: strings.Join(staticParts, "\n\n"),
+			CacheControl: &struct {
+				Type string `json:"type"`
+			}{Type: "ephemeral"},
+		})
+	}
+
+	// Dynamic sections: each as a separate block, last one gets cache_control
+	for i, part := range dynamicParts {
+		var cc *struct {
+			Type string `json:"type"`
+		}
+		if i == len(dynamicParts)-1 {
+			cc = &struct {
+				Type string `json:"type"`
+			}{Type: "ephemeral"}
+		}
+		blocks = append(blocks, CachedSystemBlock{
+			Type:        "text",
+			Text:        part,
+			CacheControl: cc,
+		})
+	}
+
+	return blocks
+}
+
 func (b *SystemPromptBuilder) environmentSection() string {
 	cwd := "unknown"
 	date := "unknown"
@@ -788,18 +852,23 @@ func DefaultSystemPrompt(modelName string) string {
 // BuildSystemPromptWithMemory builds the default system prompt with memory context included.
 // This is used when the memory system is available to include session-specific guidance.
 func BuildSystemPromptWithMemory(modelName string, memSys *MemorySystem) string {
+	builder := NewSystemPromptBuilderWithMemory(modelName, memSys)
+	return builder.Render()
+}
+
+// NewSystemPromptBuilderWithMemory creates a fully configured SystemPromptBuilder
+// with OS, model, project context, and memory system.
+func NewSystemPromptBuilderWithMemory(modelName string, memSys *MemorySystem) *SystemPromptBuilder {
 	cwd, _ := os.Getwd()
 	currentDate := time.Now().Format("2006-01-02")
 
 	ctx, _ := DiscoverProjectContextWithGit(cwd, currentDate)
 
-	builder := NewSystemPromptBuilder().
+	return NewSystemPromptBuilder().
 		WithOS(runtime.GOOS, getOSVersion()).
 		WithModelName(modelName).
 		WithProjectContext(ctx).
 		WithMemorySystem(memSys)
-
-	return builder.Render()
 }
 
 func getOSVersion() string {

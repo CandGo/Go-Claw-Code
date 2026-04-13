@@ -18,6 +18,10 @@ import (
 // Version is set at build time via -ldflags.
 var Version = "0.4.0"
 
+// GlobalVoiceInput is set by main to allow slash commands to access voice input.
+// Uses interface{} to avoid importing the voice package (which has heavy native deps).
+var GlobalVoiceInput interface{}
+
 // debugToolCallEnabled tracks the debug-tool-call toggle state.
 var debugToolCallEnabled bool
 
@@ -86,6 +90,7 @@ func Commands() []CommandSpec {
 		{Name: "review-pr", Summary: "Review a pull request", Args: "[PR number or URL]", Handler: cmdReviewPR},
 		{Name: "vim", Summary: "Toggle vim keybinding mode in input", ResumeMode: true, Handler: cmdVim},
 		{Name: "statusline", Summary: "Configure status line display", ResumeMode: true, Handler: cmdStatusLine},
+		{Name: "reflect", Summary: "Toggle reflection mode (self-evaluation after responses)", ResumeMode: true, Handler: cmdReflect},
 		{Name: "grep-tool", Summary: "Search tool definitions by name or keyword", Args: "<query>", ResumeMode: true, Handler: cmdGrepTool},
 		{Name: "mcp", Summary: "Manage MCP server connections", Args: "[list|restart <name>]", ResumeMode: true, Handler: cmdMCP},
 	}
@@ -1017,15 +1022,28 @@ func cmdStatusLine(args string) (string, error) {
 	case "hide":
 		globalRuntimeControl.SetSetting("statusline_visible", "false")
 		return "Status line hidden.", nil
-	case "":
+	default:
 		visible := globalRuntimeControl.Setting("statusline_visible")
 		if visible == "" {
 			visible = "true"
 		}
-		return fmt.Sprintf("Status line: %s\nUse /statusline show|hide to toggle.", visible), nil
-	default:
-		return "Usage: /statusline [show|hide]", nil
+		return "Status line: " + visible + ". Use /statusline show|hide to toggle.", nil
 	}
+}
+
+func cmdReflect(args string) (string, error) {
+	if globalRuntimeControl == nil {
+		return "", fmt.Errorf("runtime not initialized")
+	}
+	current := globalRuntimeControl.Setting("reflection_enabled")
+	if current == "true" {
+		globalRuntimeControl.SetSetting("reflection_enabled", "false")
+		globalRuntimeControl.SetReflectionEnabled(false)
+		return "Reflection mode disabled. Agent will respond directly.", nil
+	}
+	globalRuntimeControl.SetSetting("reflection_enabled", "true")
+	globalRuntimeControl.SetReflectionEnabled(true)
+	return "Reflection mode enabled. Agent will self-evaluate responses before finalizing.", nil
 }
 
 func cmdGrepTool(args string) (string, error) {

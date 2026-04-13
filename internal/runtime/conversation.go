@@ -27,8 +27,10 @@ type ConversationRuntime struct {
 	model        string
 	maxIter      int
 	systemPrompt       string
+	systemPromptBuilder *SystemPromptBuilder // for cached prompt with cache_control
 	settings           map[string]string
 	permissionPrompter PermissionPrompter
+	reflectionEnabled  bool // when true, adds self-evaluation prompt after agent responds
 }
 
 // NewConversationRuntime creates a new conversation runtime.
@@ -189,6 +191,20 @@ func (rt *ConversationRuntime) RunTurn(ctx context.Context, prompt string) ([]Tu
 		// If no tool calls, we're done
 		if len(toolCalls) == 0 {
 			allOutputs = append(allOutputs, TurnOutput{Type: "text", Text: joinStrings(textParts)})
+
+			// Reflection pattern: inject self-evaluation after agent work to improve quality
+			if rt.reflectionEnabled && i > 0 && len(textParts) > 0 {
+				reflectionPrompt := "Before finalizing, review your work: " +
+					"1) Did you complete all parts of the user's request? " +
+					"2) Are there any errors or edge cases you missed? " +
+					"3) Is the code/test change correct and complete? " +
+					"If you find issues, use the appropriate tools to fix them. " +
+					"If everything looks good, no further action needed."
+				rt.session.Messages = append(rt.session.Messages, ConversationMessage{
+					Role:    MsgRoleUser,
+					Content: []ContentBlock{&TextBlock{Text: reflectionPrompt}},
+				})
+			}
 			break
 		}
 
@@ -378,7 +394,26 @@ func (rt *ConversationRuntime) buildRequest() *api.MessageRequest {
 	if systemFromMessages != "" {
 		combinedSystem += "\n\n" + systemFromMessages
 	}
-	sysPrompt, _ := json.Marshal(combinedSystem)
+
+	// Use cached system prompt with cache_control breakpoints for Anthropic prompt caching.
+	// Falls back to flat string if systemPromptBuilder is not available.
+	var sysPrompt json.RawMessage
+	if rt.systemPromptBuilder != nil {
+		cachedBlocks := rt.systemPromptBuilder.BuildCachedSystem()
+		if systemFromMessages != "" {
+			// Append extra system content as a final cached block
+			cachedBlocks = append(cachedBlocks, CachedSystemBlock{
+				Type: "text",
+				Text: systemFromMessages,
+				CacheControl: &struct {
+					Type string `json:"type"`
+				}{Type: "ephemeral"},
+			})
+		}
+		sysPrompt, _ = json.Marshal(cachedBlocks)
+	} else {
+		sysPrompt, _ = json.Marshal(combinedSystem)
+	}
 	toolDefs := rt.tools.AvailableTools()
 	toolDefs = renameToolsForPrompt(toolDefs)
 
@@ -761,8 +796,23 @@ func (rt *ConversationRuntime) SetSystemPrompt(prompt string) {
 	rt.systemPrompt = prompt
 }
 
+// SetSystemPromptBuilder sets the system prompt builder for cached prompt generation.
+func (rt *ConversationRuntime) SetSystemPromptBuilder(builder *SystemPromptBuilder) {
+	rt.systemPromptBuilder = builder
+	if builder != nil {
+		rt.systemPrompt = builder.Render()
+	}
+}
+
 // SetPermissionPrompter sets the interactive permission prompter.
 func (rt *ConversationRuntime) SetPermissionPrompter(prompter PermissionPrompter) {
 	rt.policy = rt.policy.WithPrompter(prompter)
+}
+
+// SetReflectionEnabled enables or disables the reflection pattern.
+// When enabled, a self-evaluation prompt is injected after the agent's
+// final response to encourage quality checking.
+func (rt *ConversationRuntime) SetReflectionEnabled(enabled bool) {
+	rt.reflectionEnabled = enabled
 }
 
