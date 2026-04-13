@@ -53,7 +53,7 @@ func agentTool() *ToolSpec {
 	return &ToolSpec{
 		Name:        "Agent",
 		Permission:  PermDangerFullAccess,
-		Description: "Launch a sub-agent to handle a task autonomously.",
+		Description: "Launch a specialized sub-agent to handle complex, multi-step tasks autonomously. Subagents have their own isolated context window and can use tools independently. Use for: parallel research tasks, codebase exploration requiring multiple searches, protecting the main context from large results. IMPORTANT: avoid duplicating work that subagents are already doing. Agent types: general-purpose (all tools), Explore (fast codebase search, read-only), Plan (design implementation approaches), Verification (run tests, bash read-only). Set run_in_background=true for independent work; use foreground when you need results before proceeding.",
 		InputSchema: map[string]interface{}{
 			"type": "object",
 			"additionalProperties": false,
@@ -255,7 +255,7 @@ func skillTool() *ToolSpec {
 	return &ToolSpec{
 		Name:        "Skill",
 		Permission:  PermReadOnly,
-		Description: "Execute a named skill.",
+		Description: "Execute a named skill (slash command). Skills provide specialized capabilities and domain knowledge. When a skill matches the user's request, invoke it directly. Skills are discovered from .claw/skills/ and ~/.go-claw/skills/ directories.",
 		InputSchema: map[string]interface{}{
 			"type": "object",
 			"additionalProperties": false,

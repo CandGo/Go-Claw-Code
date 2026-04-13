@@ -13,7 +13,7 @@ func multiEditTool() *ToolSpec {
 	return &ToolSpec{
 		Name:       "MultiEdit",
 		Permission: PermWorkspaceWrite,
-		Description: "Apply multiple string replacements to a single file in one invocation. Each edit replaces old_string with new_string. Edits are applied sequentially.",
+		Description: "Apply multiple string replacements to a single file in one invocation. Each edit replaces old_string with new_string. Edits are applied sequentially. Use this when you need to make several changes to the same file - it is more efficient than calling Edit multiple times. Always read the file first to verify the exact strings to replace.",
 		InputSchema: map[string]interface{}{
 			"type":                 "object",
 			"additionalProperties": false,
@@ -148,7 +148,7 @@ func statusLineTool() *ToolSpec {
 	return &ToolSpec{
 		Name:        "StatusLine",
 		Permission:  PermReadOnly,
-		Description: "Update the status line in the terminal UI. Shows persistent status information to the user.",
+		Description: "Update the status line in the terminal UI to show persistent status information to the user. Use to display current operation, progress, or context. The status line persists between interactions.",
 		InputSchema: map[string]interface{}{
 			"type":                 "object",
 			"additionalProperties": false,

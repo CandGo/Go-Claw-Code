@@ -23,7 +23,7 @@ func sleepTool() *ToolSpec {
 	return &ToolSpec{
 		Name:       "sleep",
 		Permission: PermReadOnly,
-		Description: "Sleep for a specified duration.",
+		Description: "Sleep for a specified duration in milliseconds. Avoid unnecessary sleep commands between operations that can run immediately. Only use when genuinely waiting for an external process to complete (e.g., a server starting up). Keep durations short (under 5 seconds).",
 		InputSchema: map[string]interface{}{
 			"type":                 "object",
 			"additionalProperties": false,
@@ -196,7 +196,7 @@ func notebookEditTool() *ToolSpec {
 	return &ToolSpec{
 		Name:       "NotebookEdit",
 		Permission: PermWorkspaceWrite,
-		Description: "Edit a Jupyter notebook cell.",
+		Description: "Edit a Jupyter notebook cell. Replaces the entire cell content. Supports markdown and code cell types. Use edit_mode=insert to add new cells and edit_mode=delete to remove cells. For cell output retrieval, use the Read tool on the .ipynb file.",
 		InputSchema: map[string]interface{}{
 			"type":                 "object",
 			"additionalProperties": false,

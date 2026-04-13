@@ -22,7 +22,7 @@ var (
 func todoWriteTool() *ToolSpec {
 	return &ToolSpec{
 		Name:        "TodoWrite",
-		Description: "Update the todo list to track progress on tasks.",
+		Description: "Create and manage a structured task list for your current coding session. Helps track progress and organize complex tasks. Use proactively when: tasks require 3+ distinct steps, user provides a list of items, or you need to plan multi-step work. Mark tasks as in_progress BEFORE starting work and completed IMMEDIATELY when done. Only ONE task should be in_progress at any time. Each task needs content (imperative) and activeForm (present continuous) fields.",
 		InputSchema: map[string]interface{}{
 			"type": "object",
 			"additionalProperties": false,

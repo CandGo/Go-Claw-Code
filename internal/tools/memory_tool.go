@@ -25,7 +25,7 @@ func writeMemoryTool() *ToolSpec {
 	return &ToolSpec{
 		Name:       "WriteMemory",
 		Permission: PermWorkspaceWrite,
-		Description: "Create or update a memory file. Memories are persisted across sessions and loaded into the system prompt for future conversations. Use this when the user asks you to remember something.",
+		Description: "Create or update a memory file in the persistent memory system. Memories are loaded into future conversation contexts automatically. Types: user (role/preferences), feedback (what to avoid/keep doing), project (ongoing work context), reference (external resource pointers). Do NOT save: code patterns derivable from files, git history, debugging solutions, anything in CLAUDE.md. Save only when the user explicitly asks to remember, or when you learn surprising preferences. Always verify memory is still current before acting on it.",
 		InputSchema: map[string]interface{}{
 			"type":                 "object",
 			"additionalProperties": false,

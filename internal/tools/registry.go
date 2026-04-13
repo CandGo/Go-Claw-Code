@@ -62,6 +62,7 @@ func NewToolRegistry() *ToolRegistry {
 	r.register(editTool())
 	r.register(globTool())
 	r.register(grepTool())
+	r.register(repoMapTool())
 
 	// Web tools
 	r.register(webFetchTool())
@@ -147,6 +148,7 @@ func (r *ToolRegistry) RegisterDynamic(name, description string, inputSchema map
 // planModeAllowedTools lists tools permitted during plan mode.
 var planModeAllowedTools = map[string]bool{
 	"read_file": true, "glob": true, "grep": true, "WebFetch": true, "WebSearch": true,
+		"RepoMap": true,
 	"ToolSearch": true, "Skill": true, "Agent": true, "TodoWrite": true,
 	"NotebookEdit": true, "SendUserMessage": true, "sleep": true,
 	"StructuredOutput": true, "EnterPlanMode": true, "ExitPlanMode": true,
@@ -195,6 +197,8 @@ var toolAliases = map[string]string{
 	"tool_search":    "ToolSearch",
 	"web_fetch":      "WebFetch",
 	"web_search":     "WebSearch",
+	"repomap":        "RepoMap",
+	"repo_map":       "RepoMap",
 	"web_reader":     "WebFetch",
 	"todo_write":     "TodoWrite",
 	"todo_read":      "TodoRead",
@@ -300,7 +304,7 @@ type ToolFilter struct {
 // ReadOnlyFilter returns a filter for Explore-type agents (read-only tools only).
 func ReadOnlyFilter() *ToolFilter {
 	names := []string{
-		"read_file", "glob", "grep", "WebFetch", "WebSearch",
+		"read_file", "glob", "grep", "WebFetch", "WebSearch", "RepoMap",
 		"ToolSearch", "Skill", "NotebookEdit",
 		"SendUserMessage", "sleep", "StructuredOutput",
 	}
@@ -432,7 +436,7 @@ func bashTool() *ToolSpec {
 	return &ToolSpec{
 		Name:       "bash",
 		Permission: PermDangerFullAccess,
-		Description: "Execute a bash command and return the output.",
+		Description: "Execute a bash command and return its output. Use for system commands and terminal operations that require shell execution. Prefer dedicated tools (Read, Edit, Write, Glob, Grep) over bash for file operations - they provide better user experience. The working directory persists between commands but shell state does not. Always quote file paths containing spaces. Default timeout is 2 minutes; use the timeout parameter for longer-running commands. For background execution, set run_in_background to true and use TaskOutput to retrieve results later.",
 		InputSchema: map[string]interface{}{
 			"type": "object",
 			"properties": map[string]interface{}{
@@ -493,7 +497,7 @@ func readTool() *ToolSpec {
 	return &ToolSpec{
 		Name:       "read_file",
 		Permission: PermReadOnly,
-		Description: "Read a file from the filesystem.",
+		Description: "Read a file from the local filesystem. Returns file contents with line numbers (1-indexed). Supports reading specific line ranges with offset and limit parameters, images (PNG, JPG, GIF, WebP, BMP, SVG) as base64-encoded data, and PDFs. If the path is a directory, lists its contents instead. Use this tool when you need to understand existing code before suggesting modifications.",
 		InputSchema: map[string]interface{}{
 			"type": "object",
 			"properties": map[string]interface{}{
@@ -576,7 +580,7 @@ func writeTool() *ToolSpec {
 	return &ToolSpec{
 		Name:       "write_file",
 		Permission: PermWorkspaceWrite,
-		Description: "Write content to a file, creating it if needed.",
+		Description: "Write content to a file, creating it and any parent directories if needed. Overwrites existing files completely. Prefer Edit for modifying existing files - it sends only the diff and is less error-prone. Only create new files when they are absolutely necessary for achieving your goal. Generally prefer editing existing files to creating new ones.",
 		InputSchema: map[string]interface{}{
 			"type": "object",
 			"properties": map[string]interface{}{
@@ -604,7 +608,7 @@ func editTool() *ToolSpec {
 	return &ToolSpec{
 		Name:       "edit_file",
 		Permission: PermWorkspaceWrite,
-		Description: "Replace a string in a file.",
+		Description: "Replace an exact string match in a file. The old_string must be a unique substring in the file. If it matches multiple locations, use replace_all=true to replace all occurrences. Always read the file first to understand the exact content before editing. Preserve exact indentation (tabs/spaces) as they appear in the file. Do not add features, refactor code, or make improvements beyond what was asked.",
 		InputSchema: map[string]interface{}{
 			"type": "object",
 			"properties": map[string]interface{}{
@@ -656,7 +660,7 @@ func globTool() *ToolSpec {
 	return &ToolSpec{
 		Name:       "glob",
 		Permission: PermReadOnly,
-		Description: "Find files matching a glob pattern.",
+		Description: "Find files by name pattern matching. Supports standard glob patterns like **/*.js or src/**/*.ts. Returns matching file paths sorted by modification time. Use this when searching for files by name. For content search, use Grep instead. For open-ended searches requiring multiple rounds, use the Agent tool.",
 		InputSchema: map[string]interface{}{
 			"type": "object",
 			"properties": map[string]interface{}{
@@ -684,7 +688,7 @@ func grepTool() *ToolSpec {
 	return &ToolSpec{
 		Name:       "grep",
 		Permission: PermReadOnly,
-		Description: "Search file contents with a regex pattern.",
+		Description: "Search file contents using regex patterns. Supports file type filtering, context lines, case-insensitive mode, and multiline matching. Default output mode shows file paths only; use output_mode=content to show matching lines with line numbers. Always use Grep for search tasks instead of bash grep. For searching specific files, use the glob parameter to filter.",
 		InputSchema: map[string]interface{}{
 			"type": "object",
 			"properties": map[string]interface{}{
