@@ -1,119 +1,127 @@
 # Go-Claw-Code
 
-**English** | [中文](README_CN.md)
+**中文** | [English](README_EN.md)
 
-A Go reimplementation of [Claude Code](https://docs.anthropic.com/en/docs/claude-code) — Anthropic's agentic coding CLI.
+[Claude Code](https://docs.anthropic.com/en/docs/claude-code) 的 Go 语言重新实现 — Anthropic 的智能编程 CLI 工具。
 
-**109 Go files (76 source + 33 test) · 36K lines · 4 direct dependencies · zero AI SDKs** — raw Anthropic HTTP API with SSE streaming. **305 test cases · all passing.**
+**138 个 Go 文件（103 源文件 + 35 测试文件）· 4.2 万行代码 · 4 个直接依赖 · 零 AI SDK** — 直接调用 Anthropic HTTP API，支持 SSE 流式输出。**319 个测试用例 · 全部通过。**
 
-> This is an independent community implementation and is not affiliated with or endorsed by Anthropic.
+> 本项目为独立社区实现，与 Anthropic 无关，也未获其认可。
 
 ---
 
-## Features
+## 功能特性
 
-### 42 Built-in Tools
+### 43 个内置工具
 
-| Category | Tools |
-|----------|-------|
-| File | Read (image/PDF), Write, Edit, MultiEdit, Glob, Grep |
-| Shell | Bash, PowerShell, REPL |
-| Web | WebFetch, WebSearch |
-| Agent | Agent (6 types), Skill, SendUserMessage, AskUserQuestion |
-| Planning | EnterPlanMode, ExitPlanMode |
-| Tasks | TodoWrite, TodoRead, TaskOutput, TaskStop |
-| Scheduling | CronCreate, CronDelete, CronList |
-| Memory | WriteMemory |
-| MCP | MCPReadResource, MCPListResources, MCPListPrompts, MCPGetPrompt |
-| Worktree | EnterWorktree, ExitWorktree |
-| Multi-Agent | SendMessage, TeamCreate, TeamDelete |
-| LSP | LSP (30+ languages, 8 operations) |
-| Voice | Voice (SoX/ALSA/FFmpeg recording, WAV encoding) |
-| System | ToolSearch, NotebookEdit, Sleep, ClearScreen, StatusLine, Config, StructuredOutput |
+| 分类 | 工具 |
+|------|------|
+| 文件操作 | Read（支持图片/PDF）、Write、Edit、MultiEdit、Glob、Grep、RepoMap |
+| Shell | Bash、PowerShell、REPL |
+| 网络 | WebFetch、WebSearch |
+| 浏览器 | browser_new_tab、browser_close_tab、browser_list_tabs、browser_navigate、browser_click、browser_click_at、browser_type、browser_screenshot、browser_get_content、browser_scroll、browser_back、browser_eval、browser_press_key、browser_set_files、browser_site_experience、browser_jina |
+| 桌面控制 | ComputerUse（鼠标/键盘/截屏） |
+| Agent | Agent（6 种类型）、Skill、SendUserMessage、AskUserQuestion |
+| 规划 | EnterPlanMode、ExitPlanMode |
+| 任务管理 | TodoWrite、TodoRead、TaskOutput、TaskStop |
+| 定时调度 | CronCreate、CronDelete、CronList |
+| 记忆 | WriteMemory |
+| MCP | MCPReadResource、MCPListResources、MCPListPrompts、MCPGetPrompt |
+| 工作树 | EnterWorktree、ExitWorktree |
+| 多 Agent | SendMessage、TeamCreate、TeamDelete |
+| LSP | LSP（30+ 语言、8 种操作） |
+| 语音 | Voice（SoX/ALSA/FFmpeg 录音、WAV 编码） |
+| 系统 | ToolSearch、NotebookEdit、Sleep、ClearScreen、StatusLine、Config、StructuredOutput |
 
-### 39 Slash Commands
+### 40 个斜杠命令
 
-`/help` `/status` `/model` `/permissions` `/fast` `/cost` `/compact` `/clear` `/diff` `/undo` `/commit` `/commit-push-pr` `/pr` `/review-pr` `/issue` `/branch` `/worktree` `/export` `/session` `/resume` `/config` `/memory` `/init` `/setup` `/version` `/doctor` `/context` `/todo` `/agents` `/skills` `/plugin` `/debug-tool-call` `/bughunter` `/ultraplan` `/teleport` `/vim` `/statusline` `/grep-tool` `/mcp`
+`/help` `/status` `/model` `/permissions` `/fast` `/cost` `/compact` `/clear` `/diff` `/undo` `/commit` `/commit-push-pr` `/pr` `/review-pr` `/issue` `/branch` `/worktree` `/export` `/session` `/resume` `/config` `/memory` `/init` `/setup` `/version` `/doctor` `/context` `/todo` `/agents` `/skills` `/plugin` `/debug-tool-call` `/bughunter` `/ultraplan` `/teleport` `/vim` `/statusline` `/reflect` `/grep-tool` `/mcp`
 
-### Agent Sub-Execution
+### Agent 子执行
 
-| Agent Type | Tools | Max Iter |
-|------------|-------|----------|
-| `general-purpose` | All | 32 |
-| `Explore` | Read-only | 5 |
-| `Plan` | Read-only + Agent + Todo | 3 |
-| `Verification` | Read-only + Bash + PowerShell | 10 |
-| `claw-code-guide` | Read-only + SendUserMessage | 8 |
+| Agent 类型 | 可用工具 | 最大迭代 |
+|------------|----------|----------|
+| `general-purpose` | 全部工具 | 32 |
+| `Explore` | 只读工具 | 5 |
+| `Plan` | 只读 + Agent + Todo | 3 |
+| `Verification` | 只读 + Bash + PowerShell | 10 |
+| `claw-code-guide` | 只读 + SendUserMessage | 8 |
 | `statusline-setup` | Bash + Read + Write + Edit | 10 |
 
-### First-Run Setup Wizard
+### 首次运行配置向导
 
-On first launch (no credentials detected), an interactive wizard guides you through:
+首次启动时（未检测到凭证），交互式向导自动引导：
 
-- Reuse existing Claude Code config (auto-detected)
-- Enter API Key
-- OAuth browser login
-- Custom endpoint (Zhipu GLM, DeepSeek, OpenAI, etc.)
-- Model selection with auto-configured base URL
+- 自动检测并复用已有 Claude Code 配置
+- 输入 API Key
+- OAuth 浏览器登录
+- 配置自定义端点（智谱 GLM、DeepSeek、OpenAI 等）
+- 选择模型并自动配置 Base URL
 
-Run `/setup` at any time to reconfigure.
+随时运行 `/setup` 重新配置。
 
-### Streaming TUI
+### 流式 TUI
 
-Built with [Bubble Tea](https://github.com/charmbracelet/bubbletea):
+基于 [Bubble Tea](https://github.com/charmbracelet/bubbletea) 构建：
 
-- Real-time streaming markdown with syntax highlighting (Chroma)
-- Vim keybindings (5 modes)
-- Multiline input with Shift+Enter
-- Permission prompt UI
-- Diff rendering
+- 实时流式 Markdown 渲染，支持语法高亮（Chroma）
+- Vim 键绑定（5 种模式）
+- Shift+Enter 多行输入
+- 权限确认 UI
+- Diff 渲染
 
-### Permission System
+### 权限系统
 
-8 permission modes with per-tool granularity and session-persistent "allow always" caching:
+8 种权限模式，支持按工具粒度控制，以及会话级"始终允许"缓存：
 
-`read-only` → `workspace-write` → `danger-full-access`, plus `prompt`, `plan`, `acceptEdits`, `dontAsk`, `allow`
+`read-only` → `workspace-write` → `danger-full-access`，以及 `prompt`、`plan`、`acceptEdits`、`dontAsk`、`allow`
 
-### Hook System
+### Hook 系统
 
-6 hook events with shell command execution:
+6 种 Hook 事件，通过 Shell 命令执行：
 
 `PreToolUse` / `PostToolUse` / `SubagentBefore` / `SubagentAfter` / `Notification` / `Stop`
 
-Hooks support tool pattern matching, 30s timeout, and exit code 2 = deny.
+支持工具名匹配、30 秒超时、exit code 2 = 拒绝。
 
-### Multi-Provider Support
+### 多模型支持
 
-Works with any Anthropic-compatible API endpoint:
+支持任何 Anthropic 兼容的 API 端点：
 
-| Provider | Base URL | Models |
-|----------|----------|--------|
+| 提供商 | Base URL | 模型 |
+|--------|----------|------|
 | Anthropic | `https://api.anthropic.com` | claude-sonnet-4-6, claude-opus-4-6, claude-haiku-4-5 |
-| Zhipu AI | `https://open.bigmodel.cn/api/paas/v4` | glm-5.1 |
+| 智谱 AI | `https://open.bigmodel.cn/api/paas/v4` | glm-5.1 |
 | DeepSeek | `https://api.deepseek.com` | deepseek-chat |
 | OpenAI | `https://api.openai.com/v1` | gpt-4o |
 
-### Additional Features
+### 其他特性
 
-- **LLM Compaction** — conversation summarization via LLM with heuristic fallback
-- **MCP Client** — stdio + HTTP/SSE server connections, dynamic tool registration
-- **Plugin System** — install, enable, disable, uninstall plugins with hook support
-- **OAuth/PKCE** — browser-based auth with token refresh
-- **Sandbox** — Linux namespace isolation, Windows support
-- **Session Persistence** — JSON save/load
-- **Memory System** — project and user-level memory with `MEMORY.md` index
-- **Cron Scheduler** — recurring and one-shot scheduled prompts
+- **LLM 压缩** — 通过 LLM 进行对话摘要，启发式回退
+- **MCP 客户端** — stdio + HTTP/SSE 服务器连接，动态工具注册
+- **插件系统** — 安装、启用、禁用、卸载插件，支持 Hook
+- **OAuth/PKCE** — 浏览器认证，支持 Token 刷新
+- **沙箱** — Linux namespace 隔离，Windows 支持
+- **会话持久化** — JSON 保存/加载
+- **记忆系统** — 项目级和用户级记忆，`MEMORY.md` 索引
+- **定时调度** — 循环和一次性定时提示
+- **System Prompt 缓存** — Anthropic `cache_control` 断点，减少重复 token 开销
+- **Reflection 模式** — Agent 完成任务后自动注入自评提示，提升回答质量
+- **CDP 浏览器代理** — gorilla/websocket 原生 CDP 协议，14 个 HTTP 端点，支持反风控端口拦截
+- **Computer Use** — 原生桌面控制（鼠标/键盘/截屏），Windows/macOS/Linux 三平台适配
+- **RepoMap** — Aider 风格的仓库符号地图，6 种语言符号提取
+- **OpenAI 推理 token** — 支持 o1/o3/DeepSeek-R1 的 reasoning_content 翻译
 
 ---
 
-## Quick Start
+## 快速开始
 
-### Prerequisites
+### 前置条件
 
 - Go 1.24+
-- An API key (Anthropic, Zhipu, DeepSeek, or any OpenAI-compatible endpoint)
+- API Key（Anthropic、智谱、DeepSeek 或任何 OpenAI 兼容端点）
 
-### Build
+### 构建
 
 ```bash
 git clone https://github.com/candgo1/go-claw.git
@@ -121,132 +129,144 @@ cd go-claw
 go build ./cmd/go-claw-code/
 ```
 
-### Run
+### 运行
 
 ```bash
-# Interactive REPL (first run launches setup wizard)
+# 交互式 REPL（首次运行启动配置向导）
 ./go-claw-code
 
-# One-shot mode
-./go-claw-code "list all TODO comments in this project"
+# 单次模式
+./go-claw-code "列出这个项目所有 TODO 注释"
 
-# Specify model and permission mode
-./go-claw-code --model glm-5.1 --permission-mode danger-full-access "fix the bug"
+# 指定模型和权限模式
+./go-claw-code --model glm-5.1 --permission-mode danger-full-access "修复这个 bug"
 ```
 
-### Environment Variables
+### 环境变量
 
-| Variable | Purpose |
-|----------|---------|
-| `ANTHROPIC_API_KEY` | API key (also used by Claude Code) |
-| `ANTHROPIC_BASE_URL` | API endpoint override |
-| `ANTHROPIC_MODEL` | Default model |
-| `CLAW_API_KEY` | Go-Claw-specific API key (takes priority) |
-| `CLAW_BASE_URL` | Go-Claw-specific base URL (takes priority) |
-| `CLAW_MODEL` | Go-Claw-specific model (takes priority) |
-| `CLAW_PERMISSION_MODE` | Permission mode override |
+| 变量 | 用途 |
+|------|------|
+| `ANTHROPIC_API_KEY` | API Key（也供 Claude Code 使用） |
+| `ANTHROPIC_BASE_URL` | API 端点覆盖 |
+| `ANTHROPIC_MODEL` | 默认模型 |
+| `CLAW_API_KEY` | Go-Claw 专用 API Key（优先级更高） |
+| `CLAW_BASE_URL` | Go-Claw 专用 Base URL（优先级更高） |
+| `CLAW_MODEL` | Go-Claw 专用模型（优先级更高） |
+| `CLAW_PERMISSION_MODE` | 权限模式覆盖 |
 
-### Coexisting with Claude Code
+### 与 Claude Code 共存
 
-Go-Claw-Code uses its own config directory (`~/.go-claw/`) — fully independent from Claude Code (`~/.claude/`). Both tools can be installed and used simultaneously.
+Go-Claw-Code 使用独立的配置目录（`~/.go-claw/`），与 Claude Code（`~/.claude/`）完全独立。两个工具可以同时安装、并行使用。
 
 ---
 
-## Architecture
+## 架构
 
 ```
-cmd/go-claw-code/           # Entry point
+cmd/go-claw-code/           # 入口
 internal/
-├── api/                    # Anthropic API (SSE streaming, retry, token tracking)
-├── auth/                   # OAuth/PKCE + setup wizard + credentials
-├── commands/               # 39 slash commands
-├── config/                 # Multi-layer config loading
-├── initrepo/               # Project initialization
-├── lsp/                    # LSP client integration
-├── mcp/                    # MCP protocol client (stdio + HTTP/SSE)
-├── plugins/                # Plugin manager
-├── runtime/                # Conversation loop, permissions, hooks, compaction, sessions
-├── sandbox/                # Process isolation
-├── server/                 # HTTP server mode
-├── tools/                  # 42 tool implementations
+├── api/                    # Anthropic API（SSE 流式、重试、Token 追踪、OpenAI 推理 token）
+├── auth/                   # OAuth/PKCE + 配置向导 + 凭证存储
+├── browser/                # CDP 浏览器代理（gorilla/websocket、14 个端点、反风控）
+├── commands/               # 40 个斜杠命令
+├── config/                 # 多层配置加载 + Feature Flags
+├── initrepo/               # 项目初始化
+├── lsp/                    # LSP 客户端集成
+├── mcp/                    # MCP 协议客户端（stdio + HTTP/SSE）
+├── native/                 # 原生桌面控制（鼠标/键盘/截屏，三平台适配）
+├── plugins/                # 插件管理器
+├── runtime/                # 对话循环、权限、Hook、压缩、会话、Prompt 缓存、Reflection
+├── sandbox/                # 进程隔离
+├── server/                 # HTTP 服务器模式
+├── tools/                  # 43 个工具实现（含浏览器、桌面控制、RepoMap）
 ├── tui/                    # Bubble Tea TUI
-└── voice/                  # Voice recording and transcription
+└── voice/                  # 语音录音与转写
 ```
 
-## Comparison with Rust Claude Code
+## 与 Rust 版 Claude Code 对比
 
-| Feature | Claude Code (Rust) | Go-Claw-Code |
-|---------|--------------------|--------------|
-| Language | Rust | Go |
-| Binary size | ~80MB | ~17MB |
-| Build time | minutes | seconds |
-| Tools | 38+ | 42 |
-| Slash Commands | 38+ | 39 |
-| Agent Types | 6 | 6 |
-| Permission Modes | 8 | 8 |
-| Hook Events | 6 | 6 |
-| Streaming TUI | yes | yes |
-| MCP Client | yes | yes |
-| Plugin System | no | yes |
-| Multi-Provider | Claude only | Claude + GLM + DeepSeek + OpenAI |
+| 特性 | Claude Code (Rust) | Go-Claw-Code |
+|------|--------------------|--------------|
+| 语言 | Rust | Go |
+| 二进制大小 | ~80MB | ~19MB |
+| 编译时间 | 数分钟 | 数秒 |
+| 工具数 | 38+ | 43 |
+| 斜杠命令 | 38+ | 40 |
+| Agent 类型 | 6 | 6 |
+| 权限模式 | 8 | 8 |
+| Hook 事件 | 6 | 6 |
+| 流式 TUI | yes | yes |
+| MCP 客户端 | yes | yes |
+| 插件系统 | no | yes |
+| 多模型支持 | 仅 Claude | Claude + GLM + DeepSeek + OpenAI |
 | OAuth/PKCE | yes | yes |
-| Sandbox | Linux namespaces | Linux namespaces |
-| LLM Compaction | yes | yes |
-| Memory System | yes | yes |
-| First-Run Wizard | no | yes |
-| Independent Config | no | yes |
+| 沙箱 | Linux namespaces | Linux namespaces |
+| LLM 压缩 | yes | yes |
+| 记忆系统 | yes | yes |
+| 首次运行向导 | no | yes |
+| 独立配置 | no | yes |
+| 浏览器控制 | no | yes（CDP Proxy 14 端点） |
+| 桌面控制 | no | yes（Computer Use） |
+| Prompt 缓存 | yes | yes（cache_control 断点） |
+| Reflection | no | yes |
+| RepoMap | no | yes |
 
-## Comparison with claude-code-go
+## 与 claude-code-go 对比
 
-[claude-code-go](https://github.com/zwl698/claude-code-go) is another Go implementation of Claude Code, translated from the npm package's TypeScript source maps.
+[claude-code-go](https://github.com/zwl698/claude-code-go) 是另一个 Claude Code 的 Go 实现，从 npm 包的 TypeScript source map 反编译翻译而来。
 
-### Overview
+### 概览
 
 | | **Go-Claw-Code** | **claude-code-go** |
 |--|------------------|--------------------|
-| Source | Original implementation | npm package reverse-engineered from source maps |
-| Go files | 109 | 114 |
-| Lines of code | ~36K | ~35K |
-| Test files | **33** (305 cases, all passing) | 1 |
-| CLI framework | flag (stdlib) | Cobra |
-| Docs language | English | Chinese |
+| 来源 | 原创实现 | 从 npm 包 source map 反编译翻译 |
+| Go 文件 | 138 | 114 |
+| 代码行数 | ~4.2 万 | ~3.5 万 |
+| 测试文件 | **35 个**（319 用例，全部通过） | 1 个 |
+| CLI 框架 | flag（标准库） | Cobra |
+| 文档语言 | 英文 + 中文 | 中文 |
 
-### Provider Support
+### Provider 支持
 
 | Provider | Go-Claw-Code | claude-code-go |
 |----------|:------------:|:--------------:|
 | Anthropic | yes | yes |
-| Zhipu GLM | **yes** | no |
+| 智谱 GLM | **yes** | no |
 | DeepSeek | **yes** | no |
 | OpenAI | **yes** | no |
 | AWS Bedrock | **yes** | yes |
 | Google Vertex | **yes** | yes |
 | Azure Foundry | **yes** | yes |
 
-### Features
+### 功能对比
 
-| Feature | Go-Claw-Code | claude-code-go |
-|---------|:------------:|:--------------:|
-| Tools | **42** | 30+ |
-| Slash Commands | **39** | 7 |
-| Agent Types | 6 (with tool filtering) | TaskTool only |
-| Plugin System | **yes** | no |
-| Memory System | **yes** | no |
-| First-Run Wizard | **yes** | no |
-| Independent Config | **yes** (`~/.go-claw/`) | no (shares `~/.claude/`) |
-| Multi-Agent Teams | **yes** | yes |
-| Voice | **yes** | yes |
-| LSP Integration | **yes** (30+ languages) | full (30+ languages) |
-| MCP Client | yes | yes |
-| Vim Mode | yes | yes |
-| LLM Compaction | yes | yes |
-| Cron Scheduling | yes | yes |
-| Tool Error Preservation | **yes** (stderr preserved) | — |
-| Windows Adaptation | **yes** (CRLF, cmd.exe) | PowerShell tool |
+| 功能 | Go-Claw-Code | claude-code-go |
+|------|:------------:|:--------------:|
+| 工具数 | **43** | 30+ |
+| 斜杠命令 | **40** | 7 |
+| Agent 类型 | 6（带工具过滤） | 仅 TaskTool |
+| 插件系统 | **yes** | no |
+| 记忆系统 | **yes** | no |
+| 首次运行向导 | **yes** | no |
+| 独立配置 | **yes**（`~/.go-claw/`） | no（共享 `~/.claude/`） |
+| 多 Agent 团队 | **yes** | yes |
+| 语音 | **yes** | yes |
+| LSP 集成 | **yes**（30+ 语言） | 完整（30+ 语言） |
+| MCP 客户端 | yes | yes |
+| Vim 模式 | yes | yes |
+| LLM 压缩 | yes | yes |
+| 定时调度 | yes | yes |
+| 工具错误保留 | **yes**（保留 stderr） | — |
+| Windows 适配 | **yes**（CRLF、cmd.exe） | PowerShell 工具 |
+| 浏览器控制 | **yes**（CDP Proxy 14 端点） | no |
+| 桌面控制 | **yes**（Computer Use） | no |
+| Prompt 缓存 | **yes**（cache_control 断点） | no |
+| Reflection | **yes** | no |
+| RepoMap | **yes**（6 种语言） | no |
 
-### Summary
+### 总结
 
-- **Choose Go-Claw-Code** for: multi-model support (GLM/DeepSeek/OpenAI), test coverage, rich slash commands, plugin extensibility, memory system, first-run wizard, independent config coexisting with Claude Code, enterprise cloud providers (Bedrock/Vertex/Foundry), multi-agent teams, voice, LSP with 30+ languages
+- **选择 Go-Claw-Code**：多模型支持（GLM/DeepSeek/OpenAI）、测试覆盖、丰富的斜杠命令、插件扩展、记忆系统、首次运行向导、与 Claude Code 共存的独立配置、企业云 Provider（Bedrock/Vertex/Foundry）、多 Agent 团队、语音、LSP 30+ 语言支持、浏览器控制（CDP Proxy）、桌面控制（Computer Use）、Prompt 缓存、Reflection、RepoMap
 
 ## License
 
