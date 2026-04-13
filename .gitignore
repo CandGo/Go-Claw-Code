@@ -41,10 +41,8 @@ Thumbs.db
 .claude/settings.local.json
 
 # Screenshots and debug images
-*_screenshot.png
-*_real.png
-*_article.png
-*_wxua.png
+*.png
+!internal/browser/sitepatterns/*.png
 
 # Scheduled tasks
 internal/tools/.claude/
