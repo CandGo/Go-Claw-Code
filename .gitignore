@@ -39,3 +39,12 @@ Thumbs.db
 
 # Claude Code local settings
 .claude/settings.local.json
+
+# Screenshots and debug images
+*_screenshot.png
+*_real.png
+*_article.png
+*_wxua.png
+
+# Scheduled tasks
+internal/tools/.claude/
